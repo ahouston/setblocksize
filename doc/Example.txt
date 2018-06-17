@@ -1,0 +1,48 @@
+
+[root@WStation2:~/setblocksize/V0.2pre0]# ./setblocksize -b512 /dev/sg4
+
+setblocksize V0.2pre0
+
+Checking parameters ...
+   Blocksize specified.
+   Done.
+New blocksize: 512 Bytes
+Open device file ...
+   Done.
+Prepare command ...
+   Done.
+Send INQUIRY command ...
+   Done.
+Check status ...
+   Command successful.
+Check for LUN ...
+   LUN present.
+
+===============================================================================
+SCSI ID     : 3
+LUN         : 0
+Connected to: Host0 / Channel0
+Manufacturer: SEAGATE
+Model       : ST15150W
+Device type : Disk
+===============================================================================
+Do you really want to reformat this device [y/n]? y
+
+Prepare command ...
+   Done.
+Send MODE SELECT command ...
+   Done.
+Check status ...
+   Command successful.
+Prepare command ...
+   Done.
+Send FORMAT UNIT command ...
+   *** Please wait - Do not manually interrupt or power down! ***
+   Done.
+Check status ... 
+   Command successful.
+Close device file ...
+   Done.
+
+Exiting ...
+

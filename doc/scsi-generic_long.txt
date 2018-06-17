@@ -1,0 +1,2155 @@
+            Notes on Linux's SG driver version 2.1.39
+            -----------------------------------------
+                                                        20010329
+
+Introduction
+============
+The SCSI Generic driver (sg) is one of the four "high level" SCSI device
+drivers along with sd, st and sr (disk, tape and CDROM respectively). Sg
+is more generalized (but lower level) than its siblings and tends to be
+used on SCSI devices that don't fit into the already serviced categories.
+Thus sg is used for scanners, cd writers and reading audio cds digitally
+amongst other things.
+
+These are notes on the Linux SCSI generic packet device driver (sg)
+describing version 2.1.39 . The original driver was written by Lawrence
+Foard and remained in place with minimal changes since circa 1992.
+Version 2 of this driver remains backward compatible (binary and
+source **) with the original. It adds scatter gather, command queuing,
+per file descriptor sequencing, asynchronous notification and better
+error reporting.
+
+A shorter (abridged) form of this document can be found at
+http://www.torque.net/sg/p/scsi-generic.txt . It can also be found in the
+kernel source: linux/Documentation/scsi-generic.txt .
+
+The Linux 2.4 series kernels have now been released. Lk 2.4 contains
+an upgraded "version 3" sg driver which is described in a supplementary
+document at http://www.torque.net/sg/p/scsi-generic_v3.txt .
+
+The interface and usage of the original sg driver have been documented
+by Heiko Eissfeldt in a HOWTO called SCSI-Programming-HOWTO. My copy
+of the document is version 1.5 dated 7th May 1996. It can found at
+ftp://sunsite.unc.edu/pub/Linux/docs/HOWTO-SCSI-Programming-HOWTO .
+A copy of this document can be found at:
+http://www.torque.net/sg/p/original/HOWTO-SCSI-Programming-HOWTO.txt .
+
+** It is possible to write applications that perform differently
+depending on whether they are using the original or this version of
+the sg device driver. The author is not aware of any useful
+pre-existing applications that have problems with version 2.
+It may indeed be useful to distinguish between the original and the
+new driver and a following section discusses that subject.
+
+
+Architecture
+============
+The SCSI generic packet device driver (sg) is a character based device.
+It is one of the four high level device driver in the SCSI sub-system;
+the others are sd (for direct-access devices - disks), st (for tapes)
+and sr (for data cdroms). Sd and sr are block devices while st (like sg)
+is a character device.
+
+
+The unifying layer of the SCSI sub-system is the so-called mid-level.
+Below that are the "low level" drivers which are the drivers for the
+various adapters supported by Linux. Also at this level are pseudo
+adapter drivers such as ide-scsi which converts the SCSI protocol to
+ATAPI (which are similar to one another) for use by IDE devices.
+
+Since sg is a character device it supports the traditional Unix
+system calls of open(), close(), read(), write() and ioctl(). Two other
+related system calls: poll() and fcntl() are added to this list and
+how they interact with the sg device driver is documented later.
+
+An SG device is accessed by write()ing SCSI commands plus any associated
+outgoing data to it; the resulting status codes and any incoming data are
+then obtained by a read() call. The device can be opened O_NONBLOCK
+(non-blocking) and poll() used to monitor its progress. The device may be
+opened O_EXCL which excludes other "sg" users from this device (but not
+"sd", "st" or "sr" users). The buffer given to the write() call is made
+up as follows:
+        - struct sg_header image (see below)
+        - scsi command (6, 10 or 12 bytes long)
+        - data to be written to the device (if any)
+
+The buffer received from the corresponding read() call contains:
+        - struct sg_header image (check status/errors + sense_buffer)
+        - data read back from device (if any)
+
+The given SCSI command has its LUN field overwritten by the LUN value of
+the associated sg device that has been open()ed.
+
+SCSI commands are only attempted once (i.e. there are no internal
+retries). If appropriate (e.g. a SCSI READ) the data buffer is copied back
+to user space irrespective of the values of the various SCSI related
+error/status codes. [Some adapters that use an old error interface in
+the SCSI mid level ignore the retry count and retry certain errors.]
+
+
+sg_header
+=========
+This is the name of the control structure that conveys information
+about the length of data to be read/written by the associated SCSI
+command. It also conveys error and status information from the
+read() call. An instance of this structure is the first thing that
+is placed in the data buffers of both write() and read().
+
+In its original form it looked like this:
+struct sg_header {
+    int pack_len;
+    int reply_len;
+    int pack_id;
+    int result;
+    unsigned int twelve_byte:1;
+    unsigned int other_flags:31;
+    unsigned char sense_buffer[16];
+}; /* this structure is 36 bytes long */
+
+The 'pack_len' is bizarre and ends up having the 'reply_len' put in it
+(perhaps it had a use at some stage). Even though it looks like an
+input variable, it is not read by sg internally (only written).
+
+The 'reply_len' is the length of the data the corresponding read()
+will/should request (including the sg_header).
+
+The 'pack_id' is not acted upon by the sg device driver but is conveyed
+back to the corresponding read() so it can be used for sequencing by an
+application.
+
+The 'result' is also bizarre, turning certain types of host codes to 0 (no
+error), EBUSY or EIO. With better error reporting now available, the
+'result' is best ignored.
+
+The 'twelve_byte' field overrides the internal SCSI command length detection
+algorithm for group 6 and 7 commands (ie when 1st byte >= 0xc0) and forces
+a command length of 12 bytes.
+The command length detection algorithm is as follows:
+Group:  0    1    2    3    4    5    6    7
+Length: 6   10   10   12   12   12   10   10
+
+'other_flags' was originally documented as "not used" but some current
+applications assume it has 0 placed in it.
+
+The 'sense_buffer' is the first 16 bytes of SCSI sense buffer that is
+returned when the target returns a SCSI status code of CHECK_CONDITION
+or COMMAND_TERMINATED [or (driver_status & DRIVER_SENSE) is true]. This
+buffer should be at least 18 bytes long and arguably 32 bytes; unfortunately
+this is unlikely to happen in the 2.2.x series of kernels.
+
+The new sg_header offered in this driver is:
+#define SG_MAX_SENSE 16
+struct sg_header
+{
+    int pack_len;    /* [o] reply_len (ie useless) ignored as input */
+    int reply_len;   /* [i] max length of expected reply (inc. sg_header) */
+    int pack_id;     /* [io] id number of packet (use ints >= 0) */
+    int result;      /* [o] 0==ok, else (+ve) Unix errno (best ignored) */
+    unsigned int twelve_byte:1;
+        /* [i] Force 12 byte command length for group 6 & 7 commands  */
+    unsigned int target_status:5;   /* [o] scsi status from target */
+    unsigned int host_status:8;     /* [o] host status (see "DID" codes) */
+    unsigned int driver_status:8;   /* [o] driver status+suggestion */
+    unsigned int other_flags:10;    /* unused */
+    unsigned char sense_buffer[SG_MAX_SENSE]; /* [o] Output in 3 cases:
+           when target_status is CHECK_CONDITION or
+           when target_status is COMMAND_TERMINATED or
+           when (driver_status & DRIVER_SENSE) is true. */
+};      /* This structure is 36 bytes long on i386 */
+
+Firstly the new header is binary compatible with the original. This is
+important for keeping existing apps working without recompilation.
+
+Only those elements (or fields) that are new or in some way different
+from the original are documented below.
+
+'pack_id' becomes input to a read() when ioctl(sg_fd, SG_SET_FORCE_PACK_ID,
+&one) is active. A 'pack_id' of -1 is interpreted as fetch the oldest
+waiting packet; any other value will cause the read() to wait (or yield
+EAGAIN) until a packet with that 'pack_id' becomes available. In all cases
+the value of 'pack_id' available after a read() is the value given to that
+variable in the prior, corresponding write().
+
+The SCSI command length can now be given directly using the SG_NEXT_CMD_LEN
+ioctl().
+
+The 'target_status' field is always output and is the (masked and shifted
+1 bit right) SCSI status code from the target device. The allowable
+values are (found in <scsi/scsi.h>):
+/* N.B. 1 bit offset from usual SCSI status values */
+#define GOOD                 0x00
+#define CHECK_CONDITION      0x01
+#define CONDITION_GOOD       0x02
+#define BUSY                 0x04
+#define INTERMEDIATE_GOOD    0x08
+#define INTERMEDIATE_C_GOOD  0x0a
+#define RESERVATION_CONFLICT 0x0c
+#define COMMAND_TERMINATED   0x11
+#define QUEUE_FULL           0x14
+When the 'target_status' is CHECK_CONDITION or COMMAND_TERMINATED the
+'sense_buffer' is output. Note that when (driver_status & DRIVER_SENSE)
+is true then the 'sense_buffer' is also output (this seems to occur when
+the ide-scsi emulation is used). When the 'sense_buffer' is output the
+SCSI Sense Key can be found at (sense_buffer[2] & 0x0f) .
+
+The 'host_status' field is always output and has the following values
+whose "defines" are not visible outside the kernel. A copy of these
+defines can be found in sg_err.h (see the utilities section):
+#define DID_OK          0x00 /* NO error                                */
+#define DID_NO_CONNECT  0x01 /* Couldn't connect before timeout period  */
+#define DID_BUS_BUSY    0x02 /* BUS stayed busy through time out period */
+#define DID_TIME_OUT    0x03 /* TIMED OUT for other reason              */
+#define DID_BAD_TARGET  0x04 /* BAD target, device not responding       */
+#define DID_ABORT       0x05 /* Told to abort for some other reason     */
+#define DID_PARITY      0x06 /* Parity error                            */
+#define DID_ERROR       0x07 /* Internal error [DMA underrun on aic7xxx]*/
+#define DID_RESET       0x08 /* Reset by somebody.                      */
+#define DID_BAD_INTR    0x09 /* Got an interrupt we weren't expecting.  */
+#define DID_PASSTHROUGH 0x0a /* Force command past mid-layer            */
+#define DID_SOFT_ERROR  0x0b /* The low level driver wants a retry      */
+
+The 'driver_status' field is always output. When ('driver_status' &
+DRIVER_SENSE) is true the 'sense_buffer' is also output. A copy of these
+defines can be found in sg_err.h (see the utilities section):
+#define DRIVER_OK           0x00 /* Typically no suggestion */
+#define DRIVER_BUSY         0x01
+#define DRIVER_SOFT         0x02
+#define DRIVER_MEDIA        0x03
+#define DRIVER_ERROR        0x04
+#define DRIVER_INVALID      0x05
+#define DRIVER_TIMEOUT      0x06
+#define DRIVER_HARD         0x07
+#define DRIVER_SENSE        0x08 /* Implies sense_buffer output */
+/* above status 'or'ed with one of the following suggestions */
+#define SUGGEST_RETRY       0x10
+#define SUGGEST_ABORT       0x20
+#define SUGGEST_REMAP       0x30
+#define SUGGEST_DIE         0x40
+#define SUGGEST_SENSE       0x80
+
+'other_flags' still remains as a 10 bit field (reduced from 31 bits), so
+code that places 0 in it will still be happy. It is not used.
+
+
+Memory issues
+=============
+This driver uses a double-handling technique to move data from a SCSI
+device to the user's buffer. This technique will be termed as "indirect IO"
+here ("direct IO" is discussed in the Future Directions section). Indirect
+IO involves DMAing data from SCSI device to kernel buffers then using the
+CPU to move it from these kernel buffers to the user space (or vice versa
+in the case of writing data to a SCSI device).
+
+Obtaining memory for the kernel buffers for this indirect IO technique is
+the main theme of this section. These kernel buffers are needed during
+the write()-read() sequence associated with each SCSI command. The size
+of each buffer will be the maximum of the data written to the SCSI device
+(ie [write_count - sizeof(struct sg_header) - scsi_cmd_len]) or the data
+read from the SCSI device (ie [hdr.reply_len - sizeof(struct sg_header)]).
+Note that the 'read_count' does not affect the size of the kernel buffers
+but does affect the amount of data actually transferred back to the user
+space (if any).
+
+A "reserved" buffer is obtained when a file descriptor is opened. An attempt
+is made to find SG_DEF_RESERVED_SIZE bytes for the reserved buffer. The
+actual amount obtained (which may be as little as 0 bytes) can be found by
+calling the SG_GET_RESERVED_SIZE ioctl(). The size of the reserved buffer
+can subsequently be altered by calling the SG_SET_RESERVED_SIZE ioctl().
+This reserved buffer becomes the kernel buffer for a given write()-read()
+sequence if
+ 1) the reserved buffer is not already in use (eg during command queuing)
+ 2) the reserved buffer is large enough.
+If either of these condition is not met then the write() will attempt to
+allocate a kernel buffer of the requested size and free it during the
+corresponding read(). The reserved buffer is freed when the file descriptor
+is close()d. Each buffer faces the following constraints:
+ a) only "real" memory can be used (ie not swap) and must not be
+    subsequently swapped out [this is what makes direct IO so interesting]
+ b) in the case of ISA cards, only memory below the 16MB mark can be used
+    (this is a good reason to buy a PCI adapter)
+ c) if the adapter does not support scatter gather then the buffer must
+    be one contiguous piece of memory, otherwise it can be made up of
+    several contiguous pieces of memory
+ d) The biggest contiguous piece of memory in Linux 2.2 is (32 * PAGE_SIZE)
+    and there are not many of these (3 on my machine at the moment)
+PAGE_SIZE is 4096 bytes on i386 and 8192 on the alpha. Its value can be
+found by calling the getpagesize() function declared in <unistd.h> .
+
+Linux 2.2 does not put aside any memory for drivers; they just compete for
+memory with user processes and other drivers. Given the above constraints
+there are no guarantees that suitable memory will be available when
+requested. [Even drivers that grab memory while the kernel is being loaded
+could be thwarted by another driver doing the same thing!]
+
+The original sg driver uses the following technique: grab a SG_BIG_BUFF
+sized (contiguous) buffer at driver initialization and use it for all
+requests greater than PAGE_SIZE. By default SG_BIG_BUFF is set to 32 KBytes
+in the original driver but many applications suggest that the user increases
+this number. Unfortunately if the sg driver is a module then there is a high
+chance that a contiguous block of memory will not be available at module
+initialization. This results in a kernel "OOPS" in the original driver.
+
+The author has found no "silver bullet" solution but uses multiple
+techniques hoping that at least one is able provide memory at the critical
+time. Listed below are some of these techniques:
+        - obtain a reserved buffer at open() and use it if is available and
+          of sufficient size
+        - use scatter gather: then instead of one large buffer needing to
+          be found, multiple smaller buffers can be used
+        - use memory above the 16MByte level: the original driver limited
+          itself to obtaining memory below the 16MByte level (on the i386)
+          due to the shortcomings of DMA on ISA adapters. Yet more and more
+          people use PCI adapters that don't have this problem. So make
+          the decision based on the capabilities of the host adapter
+          associated with the current SCSI device at runtime
+        - if the kernel is short of memory then dip into the SCSI DMA
+          pool (maintained by the mid-level driver) to a limited extent
+
+The safest strategy for limiting memory problems is:
+  1) after open() on the sg device, if the SG_DEF_RESERVED_SIZE is not large
+     enough, then use the SG_SET_RESERVED_SIZE ioctl() and attempt to
+     increase it
+  2) in all cases now call the SG_GET_RESERVED_SIZE ioctl() and see how much
+     was actually reserved; if this is not enough exit
+  3) don't use command queuing
+  4) make sure no write()-read() sequence is requesting a buffer size larger
+     than the actual reserved buffer size
+
+Alternatively, applications can be written in such a way to do something
+sensible (eg request a smaller buffer) when a write() returns an ENOMEM
+error.
+
+A discussion on tuning SG_BIG_BUFF, SG_DEF_RESERVED_SIZE and SG_SCATTER_SZ
+is in a later section.
+
+
+System Calls
+============
+What follows are descriptions of the characteristics of the standard
+Unix operating system calls when applied to a SCSI generic device
+using this version of the device driver.
+
+open(const char * filename, int flags)
+--------------------------------------
+The filename should be an 'sg' device such as
+/dev/sg[0,1,2,...]
+/dev/sg[a-z]              <<< now deprecated >>>
+or a symbolic link to one of these. [Devfs has its own sub-directory for
+sg devices with entries like: /dev/sg/c1b2t3u4 .] It seems as though SCSI
+devices are allocated to sg minor numbers in the same order as they appear
+in 'cat /proc/scsi/scsi'. Sg is a "character" based Linux device driver.
+This means it has an open/close/read/write/ioctl type interface.
+
+Flags can be either O_RDONLY or O_RDWR or-ed with either
+O_EXCL          waits for other opens on sg device to be closed before
+                proceeding. If O_NONBLOCK is set then yields EBUSY when
+                someone else has the sg device open. The combination of
+                O_RDONLY and O_EXCL is disallowed.
+O_NONBLOCK      Sets non-blocking mode. Calls that would otherwise block
+                yield EAGAIN (eg read() ) or EBUSY (eg open() ).
+
+The original version of sg did not allow the O_RDONLY (yielding a EACCES
+error). This version allows it for accessing ioctls (e.g. doing an sg
+device scan with the SG_GET_SCSI_ID ioctl) but write()s will not be
+allowed. These flags are found in <fcntl.h> .
+
+By default, sequencing is per file descriptor in this version of sg. This
+means, for example that 2 processes can independently manipulate the same
+sg device at the same time. This may or may not make sense depending on
+the application: 2 processes (logically) reading from the same direct access
+device (ie a disk) is ok while running 2 instances of cd writing software
+on the same device at the same time probably wouldn't be a good idea. The
+previous version of sg supported only per device sequencing and this can
+still be selected with the SG_SET_MERGE_FD,1 ioctl().
+
+The driver will attempt to reserve SG_DEF_RESERVED_SIZE bytes (32KBytes in
+the current sg.h) on open(). The size of this reserved buffer can
+subsequently be modified with the SG_SET_RESERVED_SIZE ioctl(). In both
+cases these are requests subject to various dynamic constraints. The actual
+amount of memory obtained can be found by the SG_GET_RESERVED_SIZE ioctl().
+The reserved buffer will be used if:
+    -  it is not already in use (eg when command queuing is in use)
+    -  a write() does not call for a buffer size larger than the
+       reserved size.
+
+Returns a file descriptor if >= 0 , otherwise -1 implies an error.
+
+Error codes (value in 'errno' after -1 returned):
+EACCES          Either the user doesn't have appropriate permissions on
+                'filename' or attempted to use both O_RDONLY and O_EXCL
+EBUSY           O_NONBLOCK set and some user of this sg device has O_EXCL
+                set while someone is already using this device
+EINTR           while waiting for an "exclusive" lock to clear, a signal
+                is received, just try again ...
+ENODEV          sg not compiled into kernel or the kernel cannot find the
+                sg module (or it can't initialize itself (low memory??))
+ENOENT          given filename not found
+ENOMEM          An attempt to get memory to store this open's context
+                failed (this was _not_ a request to reserve DMA memory)
+ENXIO           either there is no attached device corresponding to given
+                filename or scsi sub-system is currently processing some
+                error (eg doing a device reset) or the sg driver/module
+                removed or corrupted
+
+
+write(int sg_fd, const void * buffer, size_t count)
+---------------------------------------------------
+Even though sg is a character-based device driver it sends and receives
+packets to/from the associated scsi device. Write() is used to send a
+packet containing 2 mandatory parts and 1 optional part. The mandatory
+parts are:
+  - a control block (an instance of struct sg_header)
+  - a SCSI command (6, 10 or 12 bytes long)
+The optional part is:
+  - outgoing data (eg if a SCSI write command is being sent)
+These should appear as one contiguous string in the buffer given to
+write() in the above order with no pad characters.
+
+If a write() accepts this packet then at some later time the user should
+call a read() to get the result of the SCSI command. The previous sg
+driver enforced a strict write()/read()/write()/read() regime so that a
+second write() would block until first read() was finished. This sg
+driver relaxes that condition and thereby allows command queuing
+(limit is SG_MAX_QUEUE (16) outstanding packets per file descriptor).
+However, for backward compatibility, command queuing is turned off
+by default (#define SG_DEF_COMMAND_Q 0 in sg.h). This can be changed
+via the the SG_SET_COMMAND_Q ioctl() [or by recompiling after changing
+the above define to 1].
+
+In this sg driver a write() should return more or less immediately.
+
+Returns number of bytes written if > 0 , otherwise -1 implies an error.
+
+Error codes (value in 'errno' after -1 returned):
+EACCES          opened with RD_ONLY flag
+EAGAIN          SCSI mid-level out of command blocks (rare), try again.
+                This is more likely to happen when queuing commands,
+                so wait a bit (eg usleep(10000) ) before trying again
+EDOM            a) command queuing off: a packet is already queued
+                b) command queuing on: too many packets queued
+                   (SG_MAX_QUEUE exceeded)
+EFAULT          'buffer' for 'count' bytes is an invalid memory range
+EIO             a) incoming buffer too short. It should be at least
+                   (6 + sizeof(struct sg_header))==42 bytes long
+                b) SCSI command length given in SG_NEXT_CMD_LEN too long
+                c) reply_len negative
+ENOMEM          can't get memory for DMA. Take evasive action ...
+                (see section on memory)
+ENXIO           either scsi sub-system is currently processing some error
+                (eg doing a device reset) or the sg driver/module removed
+                or corrupted
+
+
+read(int sg_fd, void * buffer, size_t count)
+--------------------------------------------
+Read() is used to receive a packet containing 1 mandatory part and 1
+optional part. The mandatory part is:
+  - a control block (an instance of struct sg_header)
+The optional part is:
+  - incoming data (eg if a SCSI read command was sent by earlier write() )
+The buffer given to a read() and its corresponding count should be
+sufficient to accommodate this packet to avoid truncation. Truncation occurs
+if count < sg_header::replylen .
+
+By default, read() will return the oldest packet queued up. If the
+SG_SET_FORCE_PACK_ID,1 ioctl() is active then read() will attempt to
+fetch the packet whose pack_id (given earlier to write()) matches the
+sg_header::pack_id given to this read(). If not available it will either
+wait or yield EAGAIN. As a special case, -1 in sg_header::pack_id given
+to read() will match the oldest packet.
+
+Returns number of bytes read if > 0 , otherwise -1 implies an error.
+Unfortunately the return value in the non-error case is simply the
+same as the count argument. It is not the actual number of bytes
+DMA-ed by the SCSI device. This driver is currently unable to provide
+such an underrun indication.
+
+If the SCSI device reports an error then a REQUEST SENSE is automatically
+done and the output is placed in the sense_buffer array which is in the
+control block. This action is sometimes called "auto-sense".
+
+Error codes (value in 'errno' after -1 returned):
+EAGAIN          either no waiting packet or requested packet is not
+                available while O_NONBLOCK flag was set
+EFAULT          'buffer' for 'count' bytes is an invalid memory range
+EINTR           while waiting for a packet, a signal is received, just
+                try again ...
+EIO             if the 'count' given to read() is < sizeof(struct sg_header)
+                and the 'result' element in sg_header is non-zero. Not a
+                recommended error reporting technique
+ENXIO           either scsi sub-system is currently processing some error
+                (eg doing a device reset) or the sg driver/module removed
+                or corrupted
+
+
+close(int sg_fd)
+----------------
+Preferably a close() should be done after all issued write()s have had
+their corresponding read() calls completed. Unfortunately this is not
+always possible. The semantics of close() in Unix are to return more
+or less immediately (ie not wait on any event) so the driver needs to
+arrange for an orderly cleanup of those packets that are still "in
+flight".
+
+A process that has an open file descriptor to an sg device may be aborted
+(eg by a kill signal). In this case, the kernel automatically calls close
+(which is called 'sg_release()' in the version 2 driver) to facilitate
+the cleanup mentioned above.
+
+A problem persists in version 2.1.39 if the sg driver is a module and is
+removed while packets are still "in flight".
+
+Returns 0 if successful, otherwise -1 implies an error.
+
+Error codes (value in 'errno' after -1 returned):
+ENXIO           sg driver/module removed or corrupted
+
+ioctl(int sg_fd, int command, ...)  [sg specific]
+-------------------------------------------------
+Ken Thompson (or perhaps some other Unix luminary) described ioctl() as
+the "garbage bin of Unix". This driver compounds the situation by adding
+more ...
+If a ioctl command is not recognized by sg (and the various lower levels
+that it may pass the command on to) then the error EINVAL occurs. If an
+invalid address is given (in the 3rd argument) then the error EFAULT occurs.
+
+Those commands with an appended "+" are new in version 2.
+
+Those commands with an appended "W" are only accessible from file
+descriptors opened with O_RDWR. They will yield EACCES otherwise.
+
+SG_GET_TIMEOUT:
+Ignores its 3rd argument and _returns_ the timeout value (which will be
+>= 0 ). The unit of this timeout is "jiffies" which are currently 10
+millisecond intervals on i386 (less on an alpha). Linux supplies
+a manifest constant HZ which is the number of "jiffies" in 1 second.
+
+SG_SET_TIMEOUT:
+Assumes 3rd argument points to an int containing the new timeout value
+for this file descriptor. The unit is a "jiffy". Packets that are
+already "in flight" will not be affected. The default value is set
+on open() and is SG_DEFAULT_TIMEOUT (defined in sg.h). This default is
+currently 1 minute and may not be long enough for formats. Negative
+values will yield an EIO error.
+
+SG_EMULATED_HOST:
+Assumes 3rd argument points to an int and outputs a flag indicating
+whether the host (adapter) is connected to a real SCSI bus or is an
+emulated one (eg ide-scsi device driver). A value of 1 means emulated
+while 0 is not.
+
+SG_SET_TRANSFORM  W:
+Only is meaningful when SG_EMULATED host has yielded 1 (i.e. the low-level
+is the ide-scsi device driver); otherwise an EINVAL error occurs. The
+default state is to _not_ transform SCSI commands to the corresponding
+ATAPI commands but pass them straight through as is. [Only certain classes
+of SCSI commands need to be transformed to their ATAPI equivalents.]
+The third argument is interpreted as an integer. When it is non-zero then
+a flag is set inside the ide-scsi driver that transforms subsequent
+commands sent to this driver. When zero is passed as the 3rd argument to
+this ioctl then the flag within the ide-scsi driver is cleared and
+subsequent commands are not transformed. Beware, this state will affect
+all devices (and hence all related sg file descriptors) associated with
+this ide-scsi "bus".
+
+SG_GET_TRANSFORM:
+Third argument is ignored. Only is meaningful when SG_EMULATED host has
+yielded 1 (ie the low-level is the ide-scsi device driver); otherwise
+an EINVAL error occurs. Returns 0 to indicate _not_ transforming SCSI
+to ATAPI commands (default). Returns 1 when it is transforming them.
+
+SG_SET_FORCE_LOW_DMA +:
+Assumes 3rd argument points to an int containing 0 or 1. 0 (default)
+means sg decides whether to use memory above 16 Mbyte level (on i386)
+based on the host adapter being used by this SCSI device. Typically
+PCI SCSI adapters will indicate they can DMA to the whole 32 bit address
+space.
+If 1 is given then the host adapter is overridden and only memory below
+the 16MB level is used for DMA. A requirement for this should be
+extremely rare. If the "reserved" buffer allocated on open() is not in
+use then it will be de-allocated and re-allocated under the 16MB level
+(and the latter operation could fail yielding ENOMEM).
+Only the current file descriptor is affected.
+
+SG_GET_LOW_DMA +:
+Assumes 3rd argument points to an int and places 0 or 1 in it. 0
+indicates the whole 32 bit address space is being used for DMA transfers
+on this file descriptor. 1 indicates the memory below the 16MB level
+(on i386) is being used (and this may be the case because the host
+adapters setting has been overridden by SG_SET_FORCE_LOW_DMA,1 .
+
+SG_GET_SCSI_ID +:
+Assumes 3rd argument is pointing to an object of type Sg_scsi_id (see
+sg.h) and populates it. That structure contains ints for host_no,
+channel, scsi_id, lun, scsi_type, allowable commands per lun and
+queue_depth. Most of this information is available from other sources
+(eg SCSI_IOCTL_GET_IDLUN and SCSI_IOCTL_GET_BUS_NUMBER) but tends to be
+awkward to collect.
+Allowable commands per lun and queue_depth give an insight to the
+command queuing capabilities of the adapters and the device. The latter
+overrides the former (logically) and the former is only of interest
+if it is equal to queue_depth which probably indicates the device
+does not support queueing commands (e.g. most scanners).
+
+SG_SET_FORCE_PACK_ID +:
+Assumes 3rd argument is pointing to an int. 0 (default) instructs read()
+to return the oldest (written) packet if multiple packets are
+waiting to be read (when command queuing is being used).
+1 instructs read() to view the sg_header::pack_id as input and return the
+oldest packet matching that pack_id or wait until it arrives (or yield
+EAGAIN if O_NONBLOCK is in force). As a special case the pack_id of -1
+given to read() in the mode will match the oldest packet.
+Only the current file descriptor is affected by this command.
+
+SG_GET_PACK_ID +:
+Assumes 3rd argument points to an int and places the pack_id of the
+oldest (written) packet in it. If no packet is waiting to be read then
+yields -1.
+
+SG_GET_NUM_WAITING +:
+Assumes 3rd argument points to an int and places the number of packets
+waiting to be read in it.
+
+SG_GET_SG_TABLESIZE +:
+Assumes 3rd argument points to an int and places the maximum number of
+scatter gather elements supported by the host adapter. 0 indicates that
+the adapter does support scatter gather.
+
+SG_SET_RESERVED_SIZE +W:
+Assumes 3rd argument is pointing to an int. That value will be used to
+request a new reserved buffer of that size. The previous reserved buffer
+is freed (if it is not in use; if it was in use -EBUSY is returned).
+A new reserved buffer is then allocated and its actual size can be found by
+calling the SG_GET_RESERVED_SIZE ioctl(). The reserved buffer is then used
+for DMA purposes by subsequent write() commands if it is not already in
+use and if the write() is not calling for a buffer size larger than that
+reserved. The reserved buffer may well be a series of kernel buffers if the
+adapter supports scatter-gather. Large buffers can be requested (eg 1 MB).
+
+SG_GET_RESERVED_SIZE +:
+Assumes 3rd argument points to an int and places the size in bytes of
+the reserved buffer from open() or the most recent SG_SET_RESERVED_SIZE
+ioctl() call on this fd. The result can be 0 if memory is very tight. In
+this case it may not be wise to attempt something like burning a CD on
+this file descriptor.
+
+SG_SET_MERGE_FD +W:
+Assumes 3rd argument is pointing to an int. 0 (the default) causes all
+subsequent sequencing to be per file descriptor. 1 causes all subsequent
+sequencing to be per device. If this command tries to change the current
+state and there is one or more _other_ file descriptors using this sg
+device then an EBUSY error occurs.  Per device sequencing was the original
+semantics and allowed, for example different processes to "share" the
+device, one perhaps write()ing with the other one read()ing. This command
+is supplied if anyone needs those semantics. Per file descriptor
+sequencing, perhaps with the use of the O_EXCL flag, seems more sensible.
+
+SG_GET_MERGE_FD +:
+Assumes 3rd argument points to an int and places 0 or 1 in it. 0 implies
+sequencing is per file descriptor. 1 implies sequencing is per device
+(original sg driver's semantics).
+
+SG_SET_COMMAND_Q +:
+Assumes 3rd argument is pointing to an int. 0 (current default, set by
+SG_DEF_COMMAND_Q in sg.h) disables command queuing. Attempts to write()
+a packet while one is already queued will result in a EDOM error.
+1 turns command queuing on.
+Changing the queuing state only affects write()s done after the change.
+Only the current file descriptor is affected by this command.
+
+SG_GET_COMMAND_Q +:
+Assumes 3rd argument points to an int and places 0 or 1 in it. 0 implies
+that command queuing is off on this file descriptor. 1 implies command
+queuing is on.
+
+SG_SET_UNDERRUN_FLAG +:
+Assumes 3rd argument is pointing to an int. 0 (current default, set by
+SG_DEF_UNDERRUN_FLAG in sg.h) requests underruns be ignored. 1 requests
+that underruns be flagged. [The only low level driver that acts on this
+at the moment is the aic7xxx which yields a DID_ERROR error on underrun.]
+Only the current file descriptor is affected by this command (unless
+"per device" sequencing has been selected).
+
+SG_GET_UNDERRUN_FLAG +:
+Assumes 3rd argument points to an int and places 0 or 1 in it. 0 implies
+that underruns are not being reported. 1 implies that underruns are being
+reported (see SG_SET_UNDERRUN_FLAG for more details).
+
+SG_NEXT_CMD_LEN +:
+Assumes 3rd argument is pointing to an int. The value of the int (if > 0)
+will be used as the SCSI command length of the next SCSI command sent to
+a write() on this fd. After that write() the SCSI command length logic is
+reset to use automatic length detection (ie depending on SCSI command group
+and the 'twelve_byte' field). If the current SCSI command length maximum of
+12 is exceeded then the affected write() will yield an EDOM error.
+Giving this ioctl() a value of 0 will set automatic length detection for
+the next write(). N.B. Only the following write() on this fd is affected by
+this ioctl().
+
+SG_GET_VERSION_NUM +:
+Assumes 3rd argument points to an int. The version number is then placed
+in that int. A sg version such as 2.1.36 will yield "20136" from this ioctl.
+
+SG_SCSI_RESET +:
+Assumes 3rd argument points to an int. Unfortunately doesn't currently
+do much (may in the future after other issues are resolved). Yields an
+EBUSY error if the SCSI bus or the associated device is being reset
+when this ioctl() is called, otherwise returns 0.
+N.B. In some recent distributions there is a patch to the SCSI mid level
+code that activates this ioctl. Check your distribution.
+
+SG_SET_DEBUG +:
+Assumes 3rd argument is pointing to an int. 0 (default) turns debugging
+off. Values > 0 cause the SCSI sense buffer to be decoded and output
+to the console/log when a SCSI device error occurs. Values > 8 cause
+the current sg device driver's state to be output to the console/log
+(this is a "one off" effect).
+If you need a _lot_ of the SCSI sub-system debug information (mainly from
+the mid-level) then try 'echo "scsi dump 0" > /proc/scsi/scsi' and lots of
+debug will appear in your console/log.
+
+ioctl(int s_fd, int command, ...)  [in common with sd, st + sr]
+---------------------------------------------------------------
+The following ioctl()s can be called from any high-level scsi device
+driver (ie sd, st, sr + sg). Access permissions may differ a little from
+one device to another, the access information given below is specific to
+the sg device driver.
+
+SCSI_IOCTL_GET_IDLUN:
+This ioctl takes a pointer to a "struct scsi_idlun" object as its third
+argument. The "struct scsi_idlun" definition is found in <scsi/scsi.h>.
+It gets populated with scsi channel, device id and lun data for the given
+device. Unfortunately that header file "hides" that structure behind a
+"#ifdef __KERNEL__" block. This probably indicates that this ioctl command
+is deprecated. To use this, that structure needs to be replicated in
+the user's program. Something like:
+typedef struct my_scsi_idlun {
+    int four_in_one;    /* 4 separate bytes of info compacted into 1 int */
+    int host_unique_id; /* distinguishes adapter cards from same supplier */
+} My_scsi_idlun;
+"four_in_one" is made up as follows:
+(scsi_device_id | (lun << 8) | (channel << 16) | (low_inode << 24))
+These 4 components are assumed (or masked) to be 1 byte each. The first
+3 should be obvious while 'low_inode' is a /proc pseudo file system entry
+for the adapter. Best not to use 'low_inode', it seems that
+SCSI_IOCTL_GET_BUS_NUMBER offers a more reliable service. The
+'host_unique_id' assigns a different number to each controller from the
+same manufacturer/low-level device driver. Most of the information
+provided by this command is more easily obtained from SG_GET_SCSI_ID.
+
+SCSI_IOCTL_GET_BUS_NUMBER:
+Takes an 'int *' as its third argument and places the bus number associated
+with a device in the associated "int". Bus numbers are allocated sequentially
+from 0 by the SCSI mid-level and are roughly one bus number per physical
+SCSI host adapter in the machine. Things like the ide-scsi emulation driver
+get their own bus number after "real" SCSI adapters. Loading a low-level
+SCSI device driver as a module will add a new bus number to the end of
+the existing sequence.
+
+SCSI_IOCTL_SEND_COMMAND   W:
+This command is forwarded onto the SCSI mid-level driver for processing.
+Essentially it is an alternate way to send a SCSI command (optionally
+with associated data), wait till the command is executed then return
+the SCSI error/status information (optionally with associated data).
+Comments in the kernel code suggest that this ioctl is deprecated.
+
+Here is a summary. The 3rd argument points to a structure looking like:
+struct sdata {
+  unsigned int inlen;      [i] Length of data to be written to device
+  unsigned int outlen;     [i] Length of data to be read from device
+  unsigned char cmd[x];    [i] SCSI command (6 <= x <= 12).
+                           [o] Data read from device starts here.
+                           [o] On error, sense buffer starts here.
+  unsigned char wdata[y];  [i] Data written to device starts here.
+};
+Notes:
+   -  The SCSI command length is determined by examining the 1st byte
+      of the given command. There is no way to override this.
+   -  Data transfers are limited to PAGE_SIZE (4K on i386, 8K on alpha).
+   -  The length (x + y) must be at least OMAX_SB_LEN bytes long to
+      accomodate the sense buffer when an error occurs.
+      The sense buffer is truncated to OMAX_SB_LEN (16) bytes so that
+      old code will not be surprised.
+   -  If a Unix error occurs (e.g. ENOMEM) then the user will receive
+      a negative return and the Unix error code in 'errno'.
+      If the SCSI command succeeds then 0 is returned.
+      Positive numbers returned are the compacted SCSI error codes (4
+      bytes in one int) where the lowest byte is the SCSI status.
+      See the drivers/scsi/scsi.h file for more information on this.
+
+One difference between SCSI commands sent to a device by this ioctl
+compared to via sg is that SCSI_IOCTL_SEND_COMMAND will do internal
+retries. Failed retries can lead to SCSI bus resets. Also if any
+status/error is detected then the sense buffer is copied back to the
+user space rather than data. For example: on a SCSI READ with
+CHECK CONDITION set and a RECOVERED ERROR indicated, you receive a
+sense buffer with that information rather than the data.
+
+
+SCSI_IOCTL_TAGGED_ENABLE  W:
+SCSI_IOCTL_TAGGED_DISABLE  W:
+SCSI_IOCTL_DOORLOCK  W:
+SCSI_IOCTL_DOORUNLOCK  W:
+SCSI_IOCTL_TEST_UNIT_READY  W:
+SCSI_IOCTL_START_UNIT  W:
+SCSI_IOCTL_STOP_UNIT  W:
+These commands ignore their third argument and do what their name suggests
+returning a compacted scsi error/status code as the result. A returned
+value of 0 means no error occurred. These commands are performed by the
+the SCSI mid-level driver.
+
+SCSI_IOCTL_PROBE_HOST:
+This command should be given a pointer to a 'char' array as its 3rd
+argument.  That array should be at least sizeof(int) long and have the
+length of the array as an 'int' at the beginning of the array! An ASCII
+string of no greater than that length containing "information" (or the
+name) of SCSI host (ie adapter) associated with this file descriptor is
+then placed in the given byte array. N.B. A trailing '\0' may need to
+be put on the output string if it has been truncated by the input
+length. Returns 1 if host is present, 0 if it is not and a negative
+value if there is an error.
+
+<any_command_not_matching_above>  W:
+Any command that "falls though" and doesn't compare to one of the above
+will be passed onto the mid level and if not resolved there will be
+passed on to the low level SCSI driver before being rejected. Some
+low level SCSI drivers support ioctls specific to their hardware.
+
+
+poll(struct pollfd * udfds, unsigned int nfds, int timeout_ms)
+--------------------------------------------------------------
+This is a native call in Linux 2.2 but most of its capabilities are available
+through the older select() call. Given a choice poll() should probably be
+used. Typically poll() is used when a sg scsi device is open()ed O_NONBLOCK
+for polling; and optionally with asynchronous notification as well using
+the fcntl() system call (below) and the SIGPOLL (aka SIGIO) signal.
+Only if something drastically is wrong (eg file handle gone stale) will
+POLLERR ever be set. POLLPRI, POLLHUP and POLLNVAL are never set.
+POLLIN is set when there is one or more packets waiting to be read.
+When POLLIN is set it implies that a read() will not block (nor yield
+EAGAIN in non-blocking mode) but return a packet immediately.
+POLLOUT (aka POLLWRNORM) is set when write() is able to accept a packet
+(ie will _not_ yield an EDOM error). The setting of POLLOUT is affected
+by the SG_SET_COMMAND_Q state: if the state is on then POLLOUT will remain
+set until the number of queued packets reaches SG_MAX_QUEUE, if the
+state is off then POLLOUT is only set when no packets are queued.
+Note that a packet can be queued after write()ing but not available to be
+read(); this typically happens when a SCSI read command is issued while
+the data is being retrieved.
+Poll() is per file descriptor unless SG_SET_MERGE_FD is set in which case
+it is per device.
+
+
+fcntl(int sg_fd, int cmd) or fcntl(int sg_fd, int cmd, long arg)
+----------------------------------------------------------------
+There are several uses for this system call in association with a sg
+file descriptor. The following pseudo code shows code that is useful for
+scanning the sg devices, taking care not to be caught in a wait for
+an O_EXCL lock by another process, and when the appropriate device is
+found, switching to normal blocked io. A working example of this logic
+is in the sg_scan utility program.
+
+open("/dev/sg0", O_RDONLY | O_NONBLOCK)
+/* check device, EBUSY means some other process has O_EXCL lock on it */
+/* when the device you want is found then ... */
+flags = fcntl(sg_fd, F_GETFL)
+fcntl(sg_fd, F_SETFL, flags & (~ O_NONBLOCK))
+/* ince, or simple apps, it is easier to use normal blocked io */
+
+
+Some work has to be done in Linux to set up for asynchronous notification.
+This is a non-blocking mode of operation in which, when the driver receives
+data back from a device so that a read() can be done, it sends a SIGPOLL
+(aka SIGIO) signal to the owning process. A working example of this logic
+is in the sg_poll test program.
+
+sigemptyset(&sig_set)
+sigaddset(&sig_set, SIGPOLL)
+sigaction(SIGPOLL, &s_action, 0)
+fcntl(sg_fd, F_SETOWN, getpid())
+flags = fcntl(sg_fd, F_GETFL);
+fcntl(sg_fd, F_SETFL, flags | O_ASYNC)
+
+
+Utility and Test Programs
+=========================
+See the README file in the sg_utils<date>.tgz tarball. Look on the
+http://www.torque.net/sg website for the latest version.
+
+Briefly, that tarball contains the following utilities:
+sg_dd512        'dd' like program that assumes 512 byte blocks size
+sg_dd2048       'dd' like program that assumes 2048 byte blocks size
+sg_dd2352       'dd' like program that assumes 2352 byte blocks size
+sgq_dd512       like 'sg_dd512' but does command queuing on "if"
+sgp_dd          probably the most flexible 'dd' variant. It uses POSIX
+                threads, block size set by "bs=..." plus other options.
+sg_scan         outputs information (optionally Inquiry) on SCSI devices
+sg_rbuf         tests SCSI bus transfer speed (without physical IO)
+sg_whoami       outputs info (optionally capacity) of given SCSI device
+sginfo          outputs "mode" information about SCSI devices (it is a
+                  re-port of the scsiinfo program onto the sg interface)
+
+It also contains the following test programs:
+sg_debug        outputs sg driver state to console/log file
+sg_poll         tests asynchronous notification
+sg_runt_ex      example run time selection program for application authors
+sg_simple1      example program first time users
+sg_simple2      like sg_simple1 but with more primitive error processing
+sg_inquiry      does a SCSI Inquiry command (from original HOWTO)
+sg_tst_med      checks presence of media (from original HOWTO)
+
+There are also 2 source files (sg_err.[hc]) for outputting and categorizing
+SCSI 2 errors and warnings. This code is used by most of the above
+utility and test programs.
+
+The following programs: sg_dd512, sg_dd2048, sg_dd2352, sg_scan, sg_runt_ex,
+sg_rbuf, sg_tst_med, sg_inquiry and sginfo, can be compiled either for this
+new sg driver _or_ the original sg driver (in 2.0 or 2.2 series kernels).
+sg_runt_ex can be run on 2.0, 2.2 or 2.3 series kernels even if it is
+compiled on a different series (eg compiled on 2.0, run on 2.2).
+
+
+Header files
+============
+User applications need to find the correct "sg.h" header file matching
+their kernel in order to write code using the sg device driver. This is
+sometimes more difficult than it should be. The correct "sg.h" will usually
+be found at /usr/src/linux/include/scsi/sg.h . Another important header
+file is "scsi.h" which will be in the same directory.
+
+Several distributions have taken their own copies of these files and placed
+them in /usr/include/scsi which is where "#include <scsi/sg.h>" would go
+looking. The directory /usr/include/scsi _should_ be a symbolic link to
+/usr/src/linux/include/scsi/ . It was is Redhat 5.1 and 5.2 but it is
+not is Redhat 6.0 . Some other distributions have the same problem. To
+solve this (as root) do the following:
+
+# cd /usr/include
+# mv scsi scsi_orig
+# ln -s ../src/linux/include/scsi scsi
+
+This doesn't seem to be a problem with /usr/include/linux (at least in
+Redhat where it is a symbolic link) so it is hard to understand why
+/usr/include/scsi is defined the way it is. The fact the
+/usr/include/linux is a symbolic link opens up the following solution
+proposed by the author of cdparanoia (Monty):
+#include <linux/../scsi/sg.h>
+
+
+Distinguishing the original from the new driver
+===============================================
+People writing applications have to cope with the existing Linux code
+base in the field. Hence there are literally millions of systems
+running Linux with the original sg driver. So the problem arises:
+how to write applications that can take advantage of the new
+features (or at least better error reporting) of this sg driver but
+still run with the original sg driver?
+
+This can be addressed at 2 levels: run time and compile time. Even
+though run time identification is a little more difficult it is more
+flexible and minimizes backward compatibility problems and thus is
+recommended.
+
+For compile time selection "#ifdef  #else  #endif" style conditional
+compilation can be used. The SG_GET_RESERVED_SIZE "#define" in sg.h
+is suitable for this purpose (ie its presence indicates the new sg driver
+while its absence indicates the original).
+
+Run time selection is more flexible and can be based on whether a
+simple ioctl() command works or not. This is best demonstrated by
+a code fragment:
+
+#ifndef SG_GET_RESERVED_SIZE
+#define SG_GET_RESERVED_SIZE 0x2272
+#endif
+
+/* Assume sg device open and fd is called 'sg_fd' */
+
+    int reserved_size = 0;
+    if (ioctl(sg_fd, SG_GET_RESERVED_SIZE, &reserved_size) < 0) {
+        reserved_size = SG_BIG_BUFF;
+        /* So we have the original sg driver ... */
+        .........
+    }
+    else {
+        /* So we have the new enhanced sg driver */
+        if (reserved_size <= 4096)
+            /* Probably should not be cutting CDs with this fd ... */
+        .........
+    }
+
+As of sg version 2.1.36 an ioctl() called SG_GET_VERSION_NUM has been
+added. It yields the version with 2 decimal digits per component. Hence
+20136 is the value associated with version 2.1.36 . The ioctl SG_SET_DEBUG
+outputs a version string to the console/log file (amongst other information).
+
+Map of SG verions to the Linux kernels in which they appear:
+       ----------        ----------------------------------
+       original          all kernels < 2.2.6
+       2.1.31            2.2.6 and 2.2.7
+       2.1.32            2.2.8 and 2.2.9
+       2.1.34            2.2.10 to 2.2.13
+       2.1.36            2.2.14 and 2.2.15
+       2.1.38            2.2.16
+       3.0.15            optional version 3 sg driver for 2.2 series
+       3.1.15            late 2.3 series approaching 2.4
+
+
+SG_BIG_BUFF and friends
+=======================
+Open source seems to attract people who like to tweak the source code
+to get (a little) extra performance. In the case of the original
+sg driver this meant increasing the value of the #define SG_BIG_BUFF
+to the maximum value of (32 * PAGE_SIZE). Even the writers of the major
+applications based on sg could not resist suggesting such a modification
+to the users. Worse still, their applications acted on that value.
+
+In the original sg driver the SG_BIG_BUFF value modified the behaviour of
+the sg driver (see "memory issues" section) and many applications based on
+sg used it as well. In this driver SG_BIG_BUFF is _not_ used internally by
+the driver. In a sense it has been decoupled.
+
+There are 3 relevant "#define"s in this driver (found in <scsi/sg.h>):
+
+#define SG_SCATTER_SZ (8 * 4096)
+#define SG_DEF_RESERVED_SIZE SG_SCATTER_SZ
+#define SG_BIG_BUFF SG_DEF_RESERVED_SIZE
+
+SG_SCATTER_SZ is the size of the largest contiguous piece of kernel memory
+that the driver will attempt to obtain. It has that value for backward
+compatibility. If a SCSI host adapter does not support scatter gather then
+it represents the largest buffer than can be used. If anything its value
+should be reduced! Best to leave it alone.
+
+SG_DEF_RESERVED_SIZE is the size of the reserved buffer that the driver
+will attempt to obtain on open(). If you have plenty of memory on your
+box, a PCI SCSI adapter that does scatter gather, then this is the one
+to play with. Try it at 512KB (524288) and see what happens. If you
+wish to find the scatter gather table size for your SCSI adapter then
+you can use the sg utility 'sg_whoami <sg_device>' and look at the value
+of sg_tablesize. If it is 0 then your SCSI adapter does not support
+scatter gather. If it is > 0 then the maximum (theoretical) sized buffer
+that can be obtained is (sg_tablesize * SG_SCATTER_SZ). This could be
+a large number (eg 8MB on this machine) and it probably makes no sense
+to try and obtain such a large buffer.
+
+SG_BIG_BUFF is not used internally by the driver. As can be seen above
+it is set to the same value as SG_DEF_RESERVED_SIZE. This can be changed
+with no adverse effect on the driver. However changing its value may well
+affect a sg-based application compiled using it. Changing its value to be
+larger than SG_DEF_RESERVED_SIZE may not be a good idea for some classes
+of applications (eg those that burn CDs). In this case the reserved
+buffer will often not be large enough forcing each write() to attempt to
+find memory; an attempt that may fail with ENOMEM in adverse situations.
+
+There is a variable in the "proc" pseudo file system related to the
+sg device. It is only visible when sg is built into the kernel (ie
+not when it is a module). It can be accessed with:
+ # cat /proc/sys/kernel/sg-big-buf
+and if present yields the size of the reserved buffer of the most recently
+opened sg device. It is deprecated as this information is available
+from the SG_GET_RESERVED_SIZE ioctl(). It only remains for backward
+compatibility.
+
+
+Shortcomings
+============
+Most real world programs need to make compromises to be implementable
+and usable. Very little software works in a vacuum especially device
+drivers. Sg is constrained by its former interface, the capabilities
+of Linux and the services offered by the Linux SCSI mid level layer.
+
+Taking the last point first, the mid level layer is the unifying layer.
+It defines most of the interfaces for both the high level drivers
+(ie sd, st, sr and sg) and the low level drivers (host adapters of which
+there are 50 or more). Given that investment, especially in those low
+level drivers, changing the mid level's interfaces is not something
+that is done lightly. It is planned that the next major changes to
+occur in that area will be in the Linux 2.3 development kernel project.
+
+The following shortcomings are listed in point form:
+      - the sense buffer array is only 16 bytes long which seems to have
+        come from SCSI 1 days. SCSI 2 requires a minimum of 18 bytes and
+        preferably 32 bytes.
+      - the actual number of bytes transferred to or from the device (eg
+        SCSI write or read respectively) is not reported. This transfer
+        is typically done by DMA independently of the main processor.
+        Underruns and overruns are potentially silently ignored.
+      - there is no (non-deprecated) way to send a device or a bus
+        reset (which may be a blessing in disguise).
+      - there is no (non-deprecated) way to abort an unfinished command
+        or shorten its timeout. A Unix close() can occur at any time
+        and coping with unfinished commands adds considerable complexity
+        to the device driver.
+      - the O_EXCL lock only prevents access by others via a sg device
+        handle. Users may still be able to access that device via sd,
+        st or sr (ie the other 3 high level SCSI device drivers).
+
+Some people would prefer a unified space for SCSI device handles in
+which packet commands could be sent to a disk via /dev/sd? or a cdrom
+via /dev/sr? , for example. It is interesting that this was previously
+attempted in Linux and some remnants still remain (eg the ioctl
+SCSI_IOCTL_SEND_COMMAND) but has comments indicating it is deprecated.
+There are arguments both ways, but from a device driver writer's
+point of view a separate character driver controlling its owns state
+is probably easier, making command queuing, non-blocking operation and
+asynchronous notification easier to implement. Remember also that Linux
+does not have the block+raw device handle model of some other Unixes.
+The downside of the separate space is that each SCSI device potentially
+appears as 2 device handles (eg often /dev/sda and /dev/sg0 will be the
+same device). Note that devices such as scanners will only be found in
+the "sg space". The difficulty for those devices that appear in both is
+what is the mapping. Various ioctls in this driver can be used to
+determine what this mapping is. Ultimately the introduction of the
+devfs pseudo file system will make this easier.
+
+
+Future Directions
+=================
+One area that may warrant investigation is "direct IO" which bypasses
+the double handling of data between the kernel buffers and the user
+space. This is not as simple as it seems and only one Linux driver
+(bttv) is currently using this technique. Recent experiments indicate
+that the maximum throughput of the sg driver run on typical hardware is
+about 20MBytes per second. This is more than sufficient for most current
+sg-based applications. Some people are interested in significantly
+higher bandwidths (eg 100MB per second) and for this direct IO would
+be required. If this sg driver was to be used for both existing
+"indirect IO"-based applications and "direct IO" experimentation
+then the latter would (most likely) be having a significantly different
+"sg_header" structure. This could be distinguished by having a negative
+number in its second integer position (ie 'reply_len's position).
+
+Investigate CAM (in FreeBSD 3.2).
+
+
+References
+==========
+http://www.t10.org      Very important site for SCSI related information.
+                        Contains SCSI 2 and 3 draft standards.
+http://www.andante.org/scsi.html
+                        This is Eric Youngdale's site. Eric is primarily
+                        responsible for the Linux SCSI architecture and
+                        its mid-level implementation.
+http://www.kernel.dk    Jens Axboe's site for Linux cdrom matters including
+                        the SCSI "sr" driver.
+http://www.torque.net/sg
+                        My site with sg related information.
+newsgroup:linux-scsi@vger.kernel.org
+                        Newsgroup for Linux related SCSI matters
+/usr/src/linux/MAINTAINERS
+                        This is a file in the Linux kernel source that
+                        contains up to date information about who maintains
+                        what and where information can be found. Links to
+                        SCSI adapter information are also here.
+
+
+Conclusion
+==========
+The SCSI generic packet device driver attempts to make as few assumptions
+as possible about the device it is connected to while giving applications
+using it as much flexibility as possible on the SCSI command level. Sg
+needs to hide the "messy" kernel related details while protecting
+the integrity of the kernel against sg "abuse". Some of these aims are
+contradictory and some compromises need to be made. For example: should
+a sg based application be able to reset a SCSI bus when that could cause
+collateral damage to a disk holding the root file system? There is no
+easy answer to this and many other related questions.
+
+If you have any suggestion about sg (or improving (the accuracy of) this
+document) please contact me.
+
+
+
+
+
+
+Appendix
+========
+The following ASCII art is obtained from draft copies (and copies of
+copies) of the SCSI 2 standard. Hopefully they are accurate.
+
+Summary of SCSI commands
+------------------------
+Shown are group 0, 1, 2 and 5 commands. [The "group" is the top 3 bits
+of the SCSI command byte.] The other groups (3, 4, 6 or 7) are reserved
+or vendor specific.
+
+                          SCSI-2 Operation Codes
+
++=========================================================================+
+|           D - DIRECT ACCESS DEVICE                   Device Column Key  |
+|           .T - SEQUENTIAL ACCESS DEVICE              M = Mandatory      |
+|           . L - PRINTER DEVICE                       O = Optional       |
+|           .  P - PROCESSOR DEVICE                    V = Vendor Specific|
+|           .  .W - WRITE ONCE READ MULTIPLE DEVICE    R = Reserved       |
+|           .  . R - READ ONLY (CD-ROM) DEVICE         . = Place holder   |
+|           .  .  S - SCANNER DEVICE                                      |
+|           .  .  .O - OPTICAL MEMORY DEVICE                              |
+|           .  .  . M - MEDIA CHANGER DEVICE                              |
+|           .  .  .  C - COMMUNICATION DEVICE                             |
+|           .  .  .  .                                                    |
+|        OP DTLPWRSOMC Description                                        |
+|----------+----------+---------------------------------------------------|
+|        00 MMMMMMMMMM TEST UNIT READY                                    |
+|        01  M         REWIND                                             |
+|        01 O V OO OO  REZERO UNIT                                        |
+|        02 VVVVVV  V                                                     |
+|        03 MMMMMMMMMM REQUEST SENSE                                      |
+|        04   O        FORMAT                                             |
+|        04 M      O   FORMAT UNIT                                        |
+|        05 VMVVVV  V  READ BLOCK LIMITS                                  |
+|        06 VVVVVV  V                                                     |
+|        07         O  INITIALIZE ELEMENT STATUS                          |
+|        07 OVV O  OV  REASSIGN BLOCKS                                    |
+|        08 .........M GET MESSAGE(06)                                    |
+|        08 OMV OO OV  READ(06)                                           |
+|        08    O       RECEIVE                                            |
+|        09 VVVVVV  V                                                     |
+|        0A   M        PRINT                                              |
+|        0A          M SEND MESSAGE(06)                                   |
+|        0A    M       SEND(06)                                           |
+|        0A OM  O  OV  WRITE(06)                                          |
+|        0B O   OO OV  SEEK(06)                                           |
+|        0B   O        SLEW AND PRINT                                     |
+|        0C VVVVVV  V                                                     |
+|        0D VVVVVV  V                                                     |
+|        0E VVVVVV  V                                                     |
+|        0F VOVVVV  V  READ REVERSE                                       |
+|        10 ..O.O..... SYNCHRONIZE BUFFER                                 |
+|        10 VM VVV     WRITE FILEMARKS                                    |
+|        11 VMVVVV     SPACE                                              |
+|        12 MMMMMMMMMM INQUIRY                                            |
+|        13 VOVVVV     VERIFY(06)                                         |
+|        14 VOOVVV     RECOVER BUFFERED DATA                              |
+|        15 OMO OOOOOO MODE SELECT(06)                                    |
+|        16 M   MM MO  RESERVE                                            |
+|        16  MM   M    RESERVE UNIT                                       |
+|        17 M   MM MO  RELEASE                                            |
+|        17  MM   M    RELEASE UNIT                                       |
+|        18 OOOOOOOO.. COPY                                               |
+|        19 VMVVVV     ERASE                                              |
+|        1A OMO OOOOOO MODE SENSE(06)                                     |
+|        1B  O         LOAD UNLOAD                                        |
+|        1B       O    SCAN                                               |
+|        1B   O        STOP PRINT                                         |
+|        1B O   OO O   STOP START UNIT                                    |
+|        1C OOOOOOOOOO RECEIVE DIAGNOSTIC RESULTS                         |
+|        1D MMMMMMMMMM SEND DIAGNOSTIC                                    |
+|        1E OO  OO OO  PREVENT ALLOW MEDIUM REMOVAL                       |
+|        1F                                                               |
+|----------+----------+---------------------------------------------------|
+|        OP DTLPWRSOMC Description                                        |
+|----------+----------+---------------------------------------------------|
+|        20 V   VV V                                                      |
+|        21 V   VV V                                                      |
+|        22 V   VV V                                                      |
+|        23 V   VV V                                                      |
+|        24 V   VVM    SET WINDOW                                         |
+|        25       O    GET WINDOW                                         |
+|        25 M   M  M   READ CAPACITY                                      |
+|        25      M     READ CD-ROM CAPACITY                               |
+|        26 V   VV                                                        |
+|        27 V   VV                                                        |
+|        28 .........O GET MESSAGE(10)                                    |
+|        28 M   MMMM   READ(10)                                           |
+|        29 V   VV O   READ GENERATION                                    |
+|        2A          O SEND MESSAGE(10)                                   |
+|        2A       O    SEND(10)                                           |
+|        2A M   M  M   WRITE(10)                                          |
+|        2B  O         LOCATE                                             |
+|        2B         O  POSITION TO ELEMENT                                |
+|        2B O   OO O   SEEK(10)                                           |
+|        2C V      O   ERASE(10)                                          |
+|        2D V   O  O   READ UPDATED BLOCK                                 |
+|        2E O   O  O   WRITE AND VERIFY(10)                               |
+|        2F O   OO O   VERIFY(10)                                         |
+|        30 O...OO.O.. SEARCH DATA HIGH(10)                               |
+|        31       O    OBJECT POSITION                                    |
+|        31 O   OO O   SEARCH DATA EQUAL(10)                              |
+|        32 O   OO O   SEARCH DATA LOW(10)                                |
+|        33 O   OO O   SET LIMITS(10)                                     |
+|        34       O    GET DATA BUFFER STATUS                             |
+|        34 O   OO O   PRE-FETCH                                          |
+|        34  O         READ POSITION                                      |
+|        35 O   OO O   SYNCHRONIZE CACHE                                  |
+|        36 O   OO O   LOCK UNLOCK CACHE                                  |
+|        37 O      O   READ DEFECT DATA(10)                               |
+|        38 ....O..O.. MEDIUM SCAN                                        |
+|        39 OOOOOOOO   COMPARE                                            |
+|        3A OOOOOOOO   COPY AND VERIFY                                    |
+|        3B OOOOOOOOOO WRITE BUFFER                                       |
+|        3C OOOOOOOOOO READ BUFFER                                        |
+|        3D     O  O   UPDATE BLOCK                                       |
+|        3E O   OO O   READ LONG                                          |
+|        3F O   O  O   WRITE LONG                                         |
+|----------+----------+---------------------------------------------------|
+|        OP DTLPWRSOMC Description                                        |
+|----------+----------+---------------------------------------------------|
+|        40 OOOOOOOOOO CHANGE DEFINITION                                  |
+|        41 O          WRITE SAME                                         |
+|        42      O     READ SUB-CHANNEL                                   |
+|        43      O     READ TOC                                           |
+|        44      O     READ HEADER                                        |
+|        45      O     PLAY AUDIO(10)                                     |
+|        46                                                               |
+|        47      O     PLAY AUDIO MSF                                     |
+|        48 .....O.... PLAY AUDIO TRACK INDEX                             |
+|        49      O     PLAY TRACK RELATIVE(10)                            |
+|        4A                                                               |
+|        4B      O     PAUSE RESUME                                       |
+|        4C OOOOOOOOOO LOG SELECT                                         |
+|        4D OOOOOOOOOO LOG SENSE                                          |
+|        4E                                                               |
+|        4F                                                               |
+|        50 ..........                                                    |
+|        51                                                               |
+|        52                                                               |
+|        53                                                               |
+|        54                                                               |
+|        55 OOO OOOOOO MODE SELECT(10)                                    |
+|        56                                                               |
+|        57                                                               |
+|        58 ..........                                                    |
+|        59                                                               |
+|        5A OOO OOOOOO MODE SENSE(10)                                     |
+|        5B                                                               |
+|        5C                                                               |
+|        5D                                                               |
+|        5E                                                               |
+|        5F                                                               |
+|----------+----------+---------------------------------------------------|
+|        OP DTLPWRSOMC Description                                        |
+|----------+----------+---------------------------------------------------|
+|        A0                                                               |
+|        A1                                                               |
+|        A2                                                               |
+|        A3                                                               |
+|        A4                                                               |
+|        A5         M  MOVE MEDIUM                                        |
+|        A5      O     PLAY AUDIO(12)                                     |
+|        A6         O  EXCHANGE MEDIUM                                    |
+|        A7                                                               |
+|        A8          O GET MESSAGE(12)                                    |
+|        A8     OO O   READ(12)                                           |
+|        A9      O     PLAY TRACK RELATIVE(12)                            |
+|        AA          O SEND MESSAGE(12)                                   |
+|        AA     O  O   WRITE(12)                                          |
+|        AB                                                               |
+|        AC        O   ERASE(12)                                          |
+|        AD                                                               |
+|        AE     O  O   WRITE AND VERIFY(12)                               |
+|        AF     OO O   VERIFY(12)                                         |
+|        B0 ....OO.O.. SEARCH DATA HIGH(12)                               |
+|        B1     OO O   SEARCH DATA EQUAL(12)                              |
+|        B2     OO O   SEARCH DATA LOW(12)                                |
+|        B3     OO O   SET LIMITS(12)                                     |
+|        B4                                                               |
+|        B5                                                               |
+|        B5         O  REQUEST VOLUME ELEMENT ADDRESS                     |
+|        B6                                                               |
+|        B6         O  SEND VOLUME TAG                                    |
+|        B7        O   READ DEFECT DATA(12)                               |
+|        B8                                                               |
+|        B8         O  READ ELEMENT STATUS                                |
+|        B9                                                               |
+|        BA                                                               |
+|        BB                                                               |
+|        BC                                                               |
+|        BD                                                               |
+|        BE                                                               |
+|        BF                                                               |
+|----------+----------+---------------------------------------------------|
+|        OP DTLPWRSOMC Description                                        |
++=========================================================================+
+
+
+
+Example of a SCSI command: READ(10) [for a direct access device]
+----------------------------------------------------------------
+As an example, here is probably the most common SCSI command sent to
+a direct access device. Given a 512 byte block size it can access
+anywhere on a 2 TeraByte disk from 1 to 65535 contiguous blocks
+(ie a maximum of 32 MBytes). That should satisfy most requirements.
+
+
+==============================================================================
+  Bit|   7    |   6    |   5    |   4    |   3    |   2    |   1    |   0    |
+Byte |        |        |        |        |        |        |        |        |
+==============================================================================
+ 0   |                  READ(10) Operation Code (28h)                        |
+-----|-----------------------------------------------------------------------|
+ 1   |   Logical Unit Number    |   DPO  |   FUA  |     Reserved    | RelAdr |
+-----|-----------------------------------------------------------------------|
+ 2   | (MSB)                                                                 |
+- - -|- -                        Logical Block Address                    - -|
+ 5   |                                                                 (LSB) |
+-----|-----------------------------------------------------------------------|
+ 6   |                           Reserved                                    |
+-----|-----------------------------------------------------------------------|
+ 7   | (MSB)                                                                 |
+-----|---                        Transfer Length                             |
+ 8   |                                                                 (LSB) |
+-----|-----------------------------------------------------------------------|
+ 9   |                           Control                                     |
+==============================================================================
+
+"A disable page out (DPO) bit of one indicates that the target shall assign
+the logical blocks accessed by this command the lowest priority for being
+fetched into or retained by the cache."
+
+"A force unit access (FUA) bit of one indicates that the target shall access
+the media in performing the command prior to returning GOOD status."
+
+The 'Control' byte and other 'Reserved' fields should be set to 0 in
+commands passed to sg. The 'Logical Unit Number' is set internally by
+the sg driver so any value given by the user is overwritten.
+
+
+
+Example of a SCSI command: INQUIRY
+----------------------------------
+It is mandatory that all SCSI targets (ie devices) support this command.
+
+==============================================================================
+  Bit|   7    |   6    |   5    |   4    |   3    |   2    |   1    |   0    |
+Byte |        |        |        |        |        |        |        |        |
+==============================================================================
+ 0   |                  INQUIRY  Operation Code (12h)                        |
+-----|-----------------------------------------------------------------------|
+ 1   | Logical Unit Number      |                  Reserved         |  EVPD  |
+-----|-----------------------------------------------------------------------|
+ 2   |                           Page Code                                   |
+-----|-----------------------------------------------------------------------|
+ 3   |                           Reserved                                    |
+-----|-----------------------------------------------------------------------|
+ 4   |                           Allocation Length                           |
+-----|-----------------------------------------------------------------------|
+ 5   |                           Control                                     |
+==============================================================================
+
+
+"An enable vital product data (EVPD) bit of one specifies that the target
+shall return the optional vital product data specified by the page code field.
+...  An EVPD bit of zero specifies that the target shall return the standard
+INQUIRY data."
+
+Unless EVPD is set 'Page Code' should be 0.
+
+"The allocation length field specifies the maximum number of bytes that an
+initiator has allocated for returned data." 36 bytes of returned data are
+mandated by the standard as shown by the following table:
+
+==============================================================================
+  Bit|   7    |   6    |   5    |   4    |   3    |   2    |   1    |   0    |
+Byte |        |        |        |        |        |        |        |        |
+==============================================================================
+ 0   | Peripheral Qualifier     |           Peripheral Device Type           |
+-----|-----------------------------------------------------------------------|
+ 1   |  RMB   |                  Device-Type Modifier                        |
+-----|-----------------------------------------------------------------------|
+ 2   |   ISO Version   |       ECMA Version       |  ANSI-Approved Version   |
+-----|-----------------------------------------------------------------------|
+ 3   |  AENC  | TrmIOP |     Reserved    |         Response Data Format      |
+-----|-----------------------------------------------------------------------|
+ 4   |                           Additional Length (n-4)                     |
+-----|-----------------------------------------------------------------------|
+ 5   |                           Reserved                                    |
+-----|-----------------------------------------------------------------------|
+ 6   |                           Reserved                                    |
+-----|-----------------------------------------------------------------------|
+ 7   | RelAdr | WBus32 | WBus16 |  Sync  | Linked |Reserved| CmdQue | SftRe  |
+-----|-+---------------------------------------------------------------------|
+ 8   | (MSB)                                                                 |
+- - -|- -                        Vendor Identification                    - -|
+ 15  |                                                                 (LSB) |
+-----|-+---------------------------------------------------------------------|
+ 16  | (MSB)                                                                 |
+- - -|- -                        Product Identification                   - -|
+ 31  |                                                                 (LSB) |
+-----|-+---------------------------------------------------------------------|
+ 32  | (MSB)                                                                 |
+- - -|- -                        Product Revision Level                   - -|
+ 35  |                                                                 (LSB) |
+-----|-+---------------------------------------------------------------------|
+ 36  |                                                                       |
+- - -|- -                        Vendor Specific                          - -|
+ 55  |                                                                       |
+-----|-+---------------------------------------------------------------------|
+ 56  |                                                                       |
+- - -|- -                        Reserved                                 - -|
+ 95  |                                                                       |
+==============================================================================
+     |                       Vendor-Specific Parameters                      |
+==============================================================================
+96 to|                           Vendor-Specific                             |
+ n   |                           Parameter Bytes                             |
+==============================================================================
+
+
+SCSI Status Byte
+----------------
+SCSI commands return a status byte. It is related to but not exactly the
+same as the 'target_status' placed in the sg_header structure passed to
+the user when a sg device handle is read(). The difference is that the
+SCSI status byte has its reserved bits masked off and it is shifted once
+right to yield the 5 bit number (ie in the range 0 to 31) that is
+'target_status'. The use of such a masked and shifted 'target_status" seems
+to be the intention of earlier Linux SCSI designers since the "Status codes"
+defines in <scsi/scsi.h> are then appropriate (eg "#define CHECK_CONDITION
+0x01"). The following table and explanation is from the SCSI 2 standard:
+
++=================================-==============================+
+|       Bits of Status Byte       |  Status                      |
+|  7   6   5   4   3   2   1   0  |                              |
+|---------------------------------+------------------------------|
+|  R   R   0   0   0   0   0   R  |  GOOD                        |
+|  R   R   0   0   0   0   1   R  |  CHECK CONDITION             |
+|  R   R   0   0   0   1   0   R  |  CONDITION MET               |
+|  R   R   0   0   1   0   0   R  |  BUSY                        |
+|  R   R   0   1   0   0   0   R  |  INTERMEDIATE                |
+|  R   R   0   1   0   1   0   R  |  INTERMEDIATE-CONDITION MET  |
+|  R   R   0   1   1   0   0   R  |  RESERVATION CONFLICT        |
+|  R   R   1   0   0   0   1   R  |  COMMAND TERMINATED          |
+|  R   R   1   0   1   0   0   R  |  QUEUE FULL                  |
+|                                 |                              |
+|       All Other Codes           |  Reserved                    |
+|----------------------------------------------------------------|
+|  Key: R = Reserved bit                                         |
++================================================================+
+
+GOOD.  This status indicates that the target has successfully completed the
+command.
+
+CHECK CONDITION.  This status indicates that a contingent allegiance
+condition has occurred. [This means the sense_buffer has been ouput.]
+
+CONDITION MET.  This status or INTERMEDIATE-CONDITION MET is returned whenever
+the requested operation is satisfied (see the SEARCH DATA and PRE-FETCH
+commands).
+
+BUSY.  This status indicates that the target is busy.  This status shall be
+returned whenever a target is unable to accept a command from an otherwise
+acceptable initiator (i.e., no reservation conflicts).  The recommended
+initiator recovery action is to issue the command again at a later time.
+
+INTERMEDIATE.  This status or INTERMEDIATE-CONDITION MET shall be returned for
+every successfully completed command in a series of linked commands (except
+the last command), unless the command is terminated with CHECK CONDITION,
+RESERVATION CONFLICT, or COMMAND TERMINATED status.  If INTERMEDIATE or
+INTERMEDIATE-CONDITION MET status is not returned, the series of linked
+commands is terminated and the I/O process is ended.
+
+INTERMEDIATE-CONDITION MET.  This status is the combination of the CONDITION
+MET and INTERMEDIATE statuses.
+
+RESERVATION CONFLICT.  This status shall be returned whenever an initiator
+attempts to access a logical unit or an extent within a logical unit that is
+reserved with a conflicting reservation type for another SCSI device (see the
+RESERVE and RESERVE UNIT commands).  The recommended initiator recovery action
+is to issue the command again at a later time.
+
+COMMAND TERMINATED.  This status shall be returned whenever the target
+terminates the current I/O process after receiving a TERMINATE I/O PROCESS
+message (see 5.6.22).  This status also indicates that a contingent allegiance
+condition has occurred. [This means the sense_buffer has been output.]
+
+QUEUE FULL.  This status shall be implemented if tagged queuing is
+implemented.  This status is returned when a SIMPLE QUEUE TAG, ORDERED QUEUE
+TAG, or HEAD OF QUEUE TAG message is received and the command queue is full.
+The I/O process is not placed in the command queue.
+
+
+Note that there are 2 status codes indicating the 'sense_buffer' is output:
+CHECK CONDITION and COMMAND TERMINATED. In addition, the 'sense_buffer' is
+also written when the DRIVER_SENSE mask is set in the 'driver_status'.
+The latter case occurs in Linux since low level drivers that emulate a
+SCSI device (eg ide-scsi) have problems "faking" the status code.
+
+Also CHECK CONDITION does not necessarily imply an error. For example,
+if the associated "sense key" (found in (sense_buffer[2] & 0xf)) is
+RECOVERED_ERROR then the requested SCSI command was completed
+successfully after the target (device) performed some remedial action.
+
+
+SCSI Sense buffer
+-----------------
+As noted above the 'sense_buffer' is output (and accessed via a read())
+when 'target_status' is CHECK_CONDITION or COMMAND_TERMINATED or when
+('driver_status' & DRIVER_SENSE) is true. Only 16 of the required 18
+bytes of the sense buffer are output.
+
+What actually happens is that when a SCSI target (device) returns a SCSI
+status code indicating the sense buffer needs to be checked, the Linux
+SCSI mid level automatically issues a follow up SCSI REQUEST SENSE command
+and conveys the ouput of this command (ie the truncated sense buffer) back
+to the 'sense_buffer' in sg's sg_header structure and thus back to the user
+via a read() call. [When a SCSI device is being emulated things are
+obviously a bit different.]
+
+The sense buffer returned by the REQUEST SENSE command looks like this:
+
+==============================================================================
+  Bit|   7    |   6    |   5    |   4    |   3    |   2    |   1    |   0    |
+Byte |        |        |        |        |        |        |        |        |
+==============================================================================
+ 0   | Valid  |                  Error Code (70h or 71h)                     |
+-----|-----------------------------------------------------------------------|
+ 1   |                           Segment Number                              |
+-----|-----------------------------------------------------------------------|
+ 2   |Filemark|  EOM   |  ILI   |Reserved|         Sense Key                 |
+-----|-----------------------------------------------------------------------|
+ 3   | (MSB)                                                                 |
+- - -|- -                        Information                              - -|
+ 6   |                                                                 (LSB) |
+-----|-----------------------------------------------------------------------|
+ 7   |                           Additional Sense Length (n-7)               |
+-----|-----------------------------------------------------------------------|
+ 8   | (MSB)                                                                 |
+- - -|- -                        Command-Specific Information             - -|
+ 11  |                                                                 (LSB) |
+-----|-----------------------------------------------------------------------|
+ 12  |                           Additional Sense Code [ASC]                 |
+-----|-----------------------------------------------------------------------|
+ 13  |                           Additional Sense Code Qualifier [ASCQ]      |
+-----|-----------------------------------------------------------------------|
+ 14  |                           Field Replaceable Unit Code                 |
+-----|-----------------------------------------------------------------------|
+15 to|  SKSV  |                                                              |
+- - -|---------- -               Sense-Key Specific                       - -|
+ 17  |                                                                       |
+-----|-----------------------------------------------------------------------|
+18 to|                                                                       |
+- - -|- -                        Additional Sense Bytes                   - -|
+ n   |                                                                       |
+==============================================================================
+
+This is a complicated beast and the reader is referred to the SCSI 2
+standard for the complete interpretation. A brief summary of the important
+fields and some rather long tables follow.
+
+The 'Valid' but is rather deceptively named and just indicates whether
+the Information field has anything in it and if so whether that value
+conforms with the standard. The important fields are the Sense Key, the
+Additional Sense Code (ASC) and the Additional Sense Code Qualifier (ASCQ)
+in that order. The Sense Key values follow:
+
+==============================================================================
+Sense Key  Description
+---------  -------------------------------------------------------------------
+   0h      NO SENSE.  Indicates that there is no specific sense key
+           information to be reported for the designated logical unit.  This
+           would be the case for a successful command or a command that
+           received CHECK CONDITION or COMMAND TERMINATED status because one
+           of the filemark, EOM, or ILI bits is set to one.
+
+   1h      RECOVERED ERROR.  Indicates that the last command completed
+           successfully with some recovery action performed by the target.
+           Details may be determinable by examining the additional sense bytes
+           and the information field.  When multiple recovered errors occur
+           during one command, the choice of which error to report (first,
+           last, most severe, etc.) is device specific.
+
+   2h      NOT READY.  Indicates that the logical unit addressed cannot be
+           accessed.  Operator intervention may be required to correct this
+           condition.
+
+   3h      MEDIUM ERROR.  Indicates that the command terminated with a non-
+           recovered error condition that was probably caused by a flaw in the
+           medium or an error in the recorded data.  This sense key may also
+           be returned if the target is unable to distinguish between a flaw
+           in the medium and a specific hardware failure (sense key 4h).
+
+   4h      HARDWARE ERROR.  Indicates that the target detected a non-
+           recoverable hardware failure (for example, controller failure,
+           device failure, parity error, etc.) while performing the command or
+           during a self test.
+
+   5h      ILLEGAL REQUEST.  Indicates that there was an illegal parameter in
+           the command descriptor block or in the additional parameters
+           supplied as data for some commands (FORMAT UNIT, SEARCH DATA,
+           etc.).  If the target detects an invalid parameter in the command
+           descriptor block, then it shall terminate the command without
+           altering the medium.  If the target detects an invalid parameter in
+           the additional parameters supplied as data, then the target may
+           have already altered the medium.  This sense key may also indicate
+           that an invalid IDENTIFY message was received (5.6.7).
+
+   6h      UNIT ATTENTION.  Indicates that the removable medium may have been
+           changed or the target has been reset.  See 6.9 for more detailed
+           information about the unit attention condition.
+
+   7h      DATA PROTECT.  Indicates that a command that reads or writes the
+           medium was attempted on a block that is protected from this
+           operation.  The read or write operation is not performed.
+
+   8h      BLANK CHECK.  Indicates that a write-once device or a sequential-
+           access device encountered blank medium or format-defined end-of-
+           data indication while reading or a write-once device encountered a
+           non-blank medium while writing.
+
+   9h      Vendor Specific.  This sense key is available for reporting vendor
+           specific conditions.
+
+   Ah      COPY ABORTED.  Indicates a COPY, COMPARE, or COPY AND VERIFY
+           command was aborted due to an error condition on the source device,
+           the destination device, or both.  (See 7.2.3.2 for additional
+           information about this sense key.)
+
+   Bh      ABORTED COMMAND.  Indicates that the target aborted the command.
+           The initiator may be able to recover by trying the command again.
+
+   Ch      EQUAL.  Indicates a SEARCH DATA command has satisfied an equal
+           comparison.
+
+   Dh      VOLUME OVERFLOW.  Indicates that a buffered peripheral device has
+           reached the end-of-partition and data may remain in the buffer that
+           has not been written to the medium.  A RECOVER BUFFERED DATA
+           command(s) may be issued to read the unwritten data from the
+           buffer.
+
+   Eh      MISCOMPARE.  Indicates that the source data did not match the data
+           read from the medium.
+
+   Fh      RESERVED.
+
+==============================================================================
+
+
+2 long tables of Additional Sense Codes (ASC) and their associated Additional
+Sense Code Qualifiers (ASCQ) follow. The same information is presented in 2
+forms: first in numerical order (by ASC then ASCQ) and then in alphabetical
+order (by description).
+
+ASC and ASCQ in numerical order
++============================================================================+
+|           D - DIRECT ACCESS DEVICE                                         |
+|           .T - SEQUENTIAL ACCESS DEVICE                                    |
+|           . L - PRINTER DEVICE                                             |
+|           .  P - PROCESSOR DEVICE                                          |
+|           .  .W - WRITE ONCE READ MULTIPLE DEVICE                          |
+|           .  . R - READ ONLY (CD-ROM) DEVICE                               |
+|           .  .  S - SCANNER DEVICE                                         |
+|           .  .  .O - OPTICAL MEMORY DEVICE                                 |
+|           .  .  . M - MEDIA CHANGER DEVICE                                 |
+|           .  .  .  C - COMMUNICATION DEVICE                                |
+|           .  .  .  .                                                       |
+| ASC ASCQ  DTLPWRSOMC  DESCRIPTION                                          |
+| --- ----              -----------------------------------------------------|
+|  00  00   DTLPWRSOMC  NO ADDITIONAL SENSE INFORMATION                      |
+|  00  01    T          FILEMARK DETECTED                                    |
+|  00  02    T    S     END-OF-PARTITION/MEDIUM DETECTED                     |
+|  00  03    T          SETMARK DETECTED                                     |
+|  00  04    T    S     BEGINNING-OF-PARTITION/MEDIUM DETECTED               |
+|  00  05    T    S     END-OF-DATA DETECTED                                 |
+|  00  06   DTLPWRSOMC  I/O PROCESS TERMINATED                               |
+|  00  11   R           AUDIO PLAY OPERATION IN PROGRESS                     |
+|  00  12   R           AUDIO PLAY OPERATION PAUSED                          |
+|  00  13   R           AUDIO PLAY OPERATION SUCCESSFULLY COMPLETED          |
+|  00  14   R           AUDIO PLAY OPERATION STOPPED DUE TO ERROR            |
+|  00  15   R           NO CURRENT AUDIO STATUS TO RETURN                    |
+|  01  00   DW  O       NO INDEX/SECTOR SIGNAL                               |
+|  02  00   DWR OM      NO SEEK COMPLETE                                     |
+|  03  00   DTL W SO    PERIPHERAL DEVICE WRITE FAULT                        |
+|  03  01    T          NO WRITE CURRENT                                     |
+|  03  02    T          EXCESSIVE WRITE ERRORS                               |
+|  04  00   DTLPWRSOMC  LOGICAL UNIT NOT READY, CAUSE NOT REPORTABLE         |
+|  04  01   DTLPWRSOMC  LOGICAL UNIT IS IN PROCESS OF BECOMING READY         |
+|  04  02   DTLPWRSOMC  LOGICAL UNIT NOT READY, INITIALIZING COMMAND REQUIRED|
+|  04  03   DTLPWRSOMC  LOGICAL UNIT NOT READY, MANUAL INTERVENTION REQUIRED |
+|  04  04   DTL    O    LOGICAL UNIT NOT READY, FORMAT IN PROGRESS           |
+|  05  00   DTL WRSOMC  LOGICAL UNIT DOES NOT RESPOND TO SELECTION           |
+|  06  00   DWR OM  NO  REFERENCE POSITION FOUND                             |
+|  07  00   DTL WRSOM   MULTIPLE PERIPHERAL DEVICES SELECTED                 |
+|  08  00   DTL WRSOMC  LOGICAL UNIT COMMUNICATION FAILURE                   |
+|  08  01   DTL WRSOMC  LOGICAL UNIT COMMUNICATION TIME-OUT                  |
+|  08  02   DTL WRSOMC  LOGICAL UNIT COMMUNICATION PARITY ERROR              |
+|  09  00   DT  WR O    TRACK FOLLOWING ERROR                                |
+|  09  01       WR O    TRACKING SERVO FAILURE                               |
+|  09  02       WR O    FOCUS SERVO FAILURE                                  |
+|  09  03       WR O    SPINDLE SERVO FAILURE                                |
+|  0A  00   DTLPWRSOMC  ERROR LOG OVERFLOW                                   |
+|  0C  00    T     S    WRITE ERROR                                          |
+|  0C  01   D   W  O    WRITE ERROR RECOVERED WITH AUTO REALLOCATION         |
+|  0C  02   D   W  O    WRITE ERROR - AUTO REALLOCATION FAILED               |
+|  10  00   D   W  O    ID CRC OR ECC ERROR                                  |
+|  11  00   DT  WRSO    UNRECOVERED READ ERROR                               |
+|  11  01   DT  W SO    READ RETRIES EXHAUSTED                               |
+|  11  02   DT  W SO    ERROR TOO LONG TO CORRECT                            |
+|  11  03   DT  W SO    MULTIPLE READ ERRORS                                 |
+|  11  04   D   W  O    UNRECOVERED READ ERROR - AUTO REALLOCATE FAILED      |
+|  11  05       WR O    L-EC UNCORRECTABLE ERROR                             |
+|  11  06       WR O    CIRC UNRECOVERED ERROR                               |
+|  11  07       W  O    DATA RESYCHRONIZATION ERROR                          |
+|  11  08    T          INCOMPLETE BLOCK READ                                |
+|  11  09    T          NO GAP FOUND                                         |
+|  11  0A   DT     O    MISCORRECTED ERROR                                   |
+|  11  0B   D   W  O    UNRECOVERED READ ERROR - RECOMMEND REASSIGNMENT      |
+|  11  0C   D   W  O    UNRECOVERED READ ERROR - RECOMMEND REWRITE THE DATA  |
+|  12  00   D   W  O    ADDRESS MARK NOT FOUND FOR ID FIELD                  |
+|  13  00   D   W  O    ADDRESS MARK NOT FOUND FOR DATA FIELD                |
+|  14  00   DTL WRSO    RECORDED ENTITY NOT FOUND                            |
+|  14  01   DT  WR O    RECORD NOT FOUND                                     |
+|  14  02    T          FILEMARK OR SETMARK NOT FOUND                        |
+|  14  03    T          END-OF-DATA NOT FOUND                                |
+|  14  04    T          BLOCK SEQUENCE ERROR                                 |
+|  15  00   DTL WRSOM   RANDOM POSITIONING ERROR                             |
+|  15  01   DTL WRSOM   MECHANICAL POSITIONING ERROR                         |
+|  15  02   DT  WR O    POSITIONING ERROR DETECTED BY READ OF MEDIUM         |
+|  16  00   DW     O    DATA SYNCHRONIZATION MARK ERROR                      |
+|  17  00   DT  WRSO    RECOVERED DATA WITH NO ERROR CORRECTION APPLIED      |
+|  17  01   DT  WRSO    RECOVERED DATA WITH RETRIES                          |
+|  17  02   DT  WR O    RECOVERED DATA WITH POSITIVE HEAD OFFSET             |
+|  17  03   DT  WR O    RECOVERED DATA WITH NEGATIVE HEAD OFFSET             |
+|  17  04       WR O    RECOVERED DATA WITH RETRIES AND/OR CIRC APPLIED      |
+|  17  05   D   WR O    RECOVERED DATA USING PREVIOUS SECTOR ID              |
+|  17  06   D   W  O    RECOVERED DATA WITHOUT ECC - DATA AUTO-REALLOCATED   |
+|  17  07   D   W  O    RECOVERED DATA WITHOUT ECC - RECOMMEND REASSIGNMENT  |
+|  17  08   D   W  O    RECOVERED DATA WITHOUT ECC - RECOMMEND REWRITE       |
+|  18  00   DT  WR O    RECOVERED DATA WITH ERROR CORRECTION APPLIED         |
+|  18  01   D   WR O    RECOVERED DATA WITH ERROR CORRECTION & RETRIES APPLIE|
+|  18  02   D   WR O    RECOVERED DATA - DATA AUTO-REALLOCATED               |
+|  18  03        R      RECOVERED DATA WITH CIRC                             |
+|  18  04        R      RECOVERED DATA WITH LEC                              |
+|  18  05   D   WR O    RECOVERED DATA - RECOMMEND REASSIGNMENT              |
+|  18  06   D   WR O    RECOVERED DATA - RECOMMEND REWRITE                   |
+|  19  00   D      O    DEFECT LIST ERROR                                    |
+|  19  01   D      O    DEFECT LIST NOT AVAILABLE                            |
+|  19  02   D      O    DEFECT LIST ERROR IN PRIMARY LIST                    |
+|  19  03   D      O    DEFECT LIST ERROR IN GROWN LIST                      |
+|  1A  00   DTLPWRSOMC  PARAMETER LIST LENGTH ERROR                          |
+|  1B  00   DTLPWRSOMC  SYNCHRONOUS DATA TRANSFER ERROR                      |
+|  1C  00   D      O    DEFECT LIST NOT FOUND                                |
+|  1C  01   D      O    PRIMARY DEFECT LIST NOT FOUND                        |
+|  1C  02   D      O    GROWN DEFECT LIST NOT FOUND                          |
+|  1D  00   D   W  O    MISCOMPARE DURING VERIFY OPERATION                   |
+|  1E  00   D   W  O    RECOVERED ID WITH ECC                                |
+|  20  00   DTLPWRSOMC  INVALID COMMAND OPERATION CODE                       |
+|  21  00   DT  WR OM   LOGICAL BLOCK ADDRESS OUT OF RANGE                   |
+|  21  01           M   INVALID ELEMENT ADDRESS                              |
+|  22  00   D           ILLEGAL FUNCTION (SHOULD USE 20 00, 24 00, OR 26 00) |
+|  24  00   DTLPWRSOMC  INVALID FIELD IN CDB                                 |
+|  25  00   DTLPWRSOMC  LOGICAL UNIT NOT SUPPORTED                           |
+|  26  00   DTLPWRSOMC  INVALID FIELD IN PARAMETER LIST                      |
+|  26  01   DTLPWRSOMC  PARAMETER NOT SUPPORTED                              |
+|  26  02   DTLPWRSOMC  PARAMETER VALUE INVALID                              |
+|  26  03   DTLPWRSOMC  THRESHOLD PARAMETERS NOT SUPPORTED                   |
+|  27  00   DT  W  O    WRITE PROTECTED                                      |
+|  28  00   DTLPWRSOMC  NOT READY TO READY TRANSITION(MEDIUM MAY HAVE CHANGED|
+|  28  01           M   IMPORT OR EXPORT ELEMENT ACCESSED                    |
+|  29  00   DTLPWRSOMC  POWER ON, RESET, OR BUS DEVICE RESET OCCURRED        |
+|  2A  00   DTL WRSOMC  PARAMETERS CHANGED                                   |
+|  2A  01   DTL WRSOMC  MODE PARAMETERS CHANGED                              |
+|  2A  02   DTL WRSOMC  LOG PARAMETERS CHANGED                               |
+|  2B  00   DTLPWRSO C  COPY CANNOT EXECUTE SINCE HOST CANNOT DISCONNECT     |
+|  2C  00   DTLPWRSOMC  COMMAND SEQUENCE ERROR                               |
+|  2C  01         S     TOO MANY WINDOWS SPECIFIED                           |
+|  2C  02         S     INVALID COMBINATION OF WINDOWS SPECIFIED             |
+|  2D  00    T          OVERWRITE ERROR ON UPDATE IN PLACE                   |
+|  2F  00   DTLPWRSOMC  COMMANDS CLEARED BY ANOTHER INITIATOR                |
+|  30  00   DT  WR OM   INCOMPATIBLE MEDIUM INSTALLED                        |
+|  30  01   DT  WR O    CANNOT READ MEDIUM - UNKNOWN FORMAT                  |
+|  30  02   DT  WR O    CANNOT READ MEDIUM - INCOMPATIBLE FORMAT             |
+|  30  03   DT          CLEANING CARTRIDGE INSTALLED                         |
+|  31  00   DT  W  O    MEDIUM FORMAT CORRUPTED                              |
+|  31  01   D L    O    FORMAT COMMAND FAILED                                |
+|  32  00   D   W  O    NO DEFECT SPARE LOCATION AVAILABLE                   |
+|  32  01   D   W  O    DEFECT LIST UPDATE FAILURE                           |
+|  33  00    T          TAPE LENGTH ERROR                                    |
+|  36  00     L         RIBBON, INK, OR TONER FAILURE                        |
+|  37  00   DTL WRSOMC  ROUNDED PARAMETER                                    |
+|  39  00   DTL WRSOMC  SAVING PARAMETERS NOT SUPPORTED                      |
+|  3A  00   DTL WRSOM   MEDIUM NOT PRESENT                                   |
+|  3B  00    TL         SEQUENTIAL POSITIONING ERROR                         |
+|  3B  01    T          TAPE POSITION ERROR AT BEGINNING-OF-MEDIUM           |
+|  3B  02    T          TAPE POSITION ERROR AT END-OF-MEDIUM                 |
+|  3B  03     L         TAPE OR ELECTRONIC VERTICAL FORMS UNIT NOT READY     |
+|  3B  04     L         SLEW FAILURE                                         |
+|  3B  05     L         PAPER JAM                                            |
+|  3B  06     L         FAILED TO SENSE TOP-OF-FORM                          |
+|  3B  07     L         FAILED TO SENSE BOTTOM-OF-FORM                       |
+|  3B  08    T          REPOSITION ERROR                                     |
+|  3B  09         S     READ PAST END OF MEDIUM                              |
+|  3B  0A         S     READ PAST BEGINNING OF MEDIUM                        |
+|  3B  0B         S     POSITION PAST END OF MEDIUM                          |
+|  3B  0C         S     POSITION PAST BEGINNING OF MEDIUM                    |
+|  3B  0D           M   MEDIUM DESTINATION ELEMENT FULL                      |
+|  3B  0E           M   MEDIUM SOURCE ELEMENT EMPTY                          |
+|  3D  00   DTLPWRSOMC  INVALID BITS IN IDENTIFY MESSAGE                     |
+|  3E  00   DTLPWRSOMC  LOGICAL UNIT HAS NOT SELF-CONFIGURED YET             |
+|  3F  00   DTLPWRSOMC  TARGET OPERATING CONDITIONS HAVE CHANGED             |
+|  3F  01   DTLPWRSOMC  MICROCODE HAS BEEN CHANGED                           |
+|  3F  02   DTLPWRSOMC  CHANGED OPERATING DEFINITION                         |
+|  3F  03   DTLPWRSOMC  INQUIRY DATA HAS CHANGED                             |
+|  40  00   D           RAM FAILURE (SHOULD USE 40 NN)                       |
+|  40  NN   DTLPWRSOMC  DIAGNOSTIC FAILURE ON COMPONENT NN (80H-FFH)         |
+|  41  00   D           DATA PATH FAILURE (SHOULD USE 40 NN)                 |
+|  42  00   D           POWER-ON OR SELF-TEST FAILURE (SHOULD USE 40 NN)     |
+|  43  00   DTLPWRSOMC  MESSAGE ERROR                                        |
+|  44  00   DTLPWRSOMC  INTERNAL TARGET FAILURE                              |
+|  45  00   DTLPWRSOMC  SELECT OR RESELECT FAILURE                           |
+|  46  00   DTLPWRSOMC  UNSUCCESSFUL SOFT RESET                              |
+|  47  00   DTLPWRSOMC  SCSI PARITY ERROR                                    |
+|  48  00   DTLPWRSOMC  INITIATOR DETECTED ERROR MESSAGE RECEIVED            |
+|  49  00   DTLPWRSOMC  INVALID MESSAGE ERROR                                |
+|  4A  00   DTLPWRSOMC  COMMAND PHASE ERROR                                  |
+|  4B  00   DTLPWRSOMC  DATA PHASE ERROR                                     |
+|  4C  00   DTLPWRSOMC  LOGICAL UNIT FAILED SELF-CONFIGURATION               |
+|  4E  00   DTLPWRSOMC  OVERLAPPED COMMANDS ATTEMPTED                        |
+|  50  00    T          WRITE APPEND ERROR                                   |
+|  50  01    T          WRITE APPEND POSITION ERROR                          |
+|  50  02    T          POSITION ERROR RELATED TO TIMING                     |
+|  51  00    T     O    ERASE FAILURE                                        |
+|  52  00    T          CARTRIDGE FAULT                                      |
+|  53  00   DTL WRSOM   MEDIA LOAD OR EJECT FAILED                           |
+|  53  01    T          UNLOAD TAPE FAILURE                                  |
+|  53  02   DT  WR OM   MEDIUM REMOVAL PREVENTED                             |
+|  54  00      P        SCSI TO HOST SYSTEM INTERFACE FAILURE                |
+|  55  00      P        SYSTEM RESOURCE FAILURE                              |
+|  57  00        R      UNABLE TO RECOVER TABLE-OF-CONTENTS                  |
+|  58  00     O         GENERATION DOES NOT EXIST                            |
+|  59  00     O         UPDATED BLOCK READ                                   |
+|  5A  00   DTLPWRSOM   OPERATOR REQUEST OR STATE CHANGE INPUT (UNSPECIFIED) |
+|  5A  01   DT  WR OM   OPERATOR MEDIUM REMOVAL REQUEST                      |
+|  5A  02   DT  W  O    OPERATOR SELECTED WRITE PROTECT                      |
+|  5A  03   DT  W  O    OPERATOR SELECTED WRITE PERMIT                       |
+|  5B  00   DTLPWRSOM   LOG EXCEPTION                                        |
+|  5B  01   DTLPWRSOM   THRESHOLD CONDITION MET                              |
+|  5B  02   DTLPWRSOM   LOG COUNTER AT MAXIMUM                               |
+|  5B  03   DTLPWRSOM   LOG LIST CODES EXHAUSTED                             |
+|  5C  00   D   O       RPL STATUS CHANGE                                    |
+|  5C  01   D   O       SPINDLES SYNCHRONIZED                                |
+|  5C  02   D   O       SPINDLES NOT SYNCHRONIZED                            |
+|  60  00         S     LAMP FAILURE                                         |
+|  61  00         S     VIDEO ACQUISITION ERROR                              |
+|  61  01         S     UNABLE TO ACQUIRE VIDEO                              |
+|  61  02         S     OUT OF FOCUS                                         |
+|  62  00         S     SCAN HEAD POSITIONING ERROR                          |
+|  63  00        R      END OF USER AREA ENCOUNTERED ON THIS TRACK           |
+|  64  00        R      ILLEGAL MODE FOR THIS TRACK                          |
+|                                                                            |
+|  80  xxh \                                                                 |
+|   THROUGH >  VENDOR SPECIFIC.                                              |
+|  FF  xxh /                                                                 |
+|                                                                            |
+|  xxh 80 \                                                                  |
+|  THROUGH >  VENDOR SPECIFIC QUALIFICATION OF STANDARD ASC.                 |
+|  xxh FF /                                                                  |
+|               ALL CODES NOT SHOWN OR BLANK ARE RESERVED.                   |
++============================================================================+
+
+
+
+ASC and ASCQ in alphabetical order by description
++============================================================================+
+|           D - DIRECT ACCESS DEVICE                                         |
+|           .T - SEQUENTIAL ACCESS DEVICE                                    |
+|           . L - PRINTER DEVICE                                             |
+|           .  P - PROCESSOR DEVICE                                          |
+|           .  .W - WRITE ONCE READ MULTIPLE DEVICE                          |
+|           .  . R - READ ONLY (CD-ROM) DEVICE                               |
+|           .  .  S - SCANNER DEVICE                                         |
+|           .  .  .O - OPTICAL MEMORY DEVICE                                 |
+|           .  .  . M - MEDIA CHANGER DEVICE                                 |
+|           .  .  .  C - COMMUNICATION DEVICE                                |
+|           .  .  .  .                                                       |
+| ASC ASCQ  DTLPWRSOMC  DESCRIPTION                                          |
+| --- ----              -----------------------------------------------------|
+| 13h  00h  D   W  O    ADDRESS MARK NOT FOUND FOR DATA FIELD                |
+| 12h  00h  D   W  O    ADDRESS MARK NOT FOUND FOR ID FIELD                  |
+| 00h  11h       R      AUDIO PLAY OPERATION IN PROGRESS                     |
+| 00h  12h       R      AUDIO PLAY OPERATION PAUSED                          |
+| 00h  14h       R      AUDIO PLAY OPERATION STOPPED DUE TO ERROR            |
+| 00h  13h       R      AUDIO PLAY OPERATION SUCCESSFULLY COMPLETED          |
+| 00h  04h   T    S     BEGINNING-OF-PARTITION/MEDIUM DETECTED               |
+| 14h  04h   T          BLOCK SEQUENCE ERROR                                 |
+| 30h  02h  DT  WR O    CANNOT READ MEDIUM - INCOMPATIBLE FORMAT             |
+| 30h  01h  DT  WR O    CANNOT READ MEDIUM - UNKNOWN FORMAT                  |
+| 52h  00h   T          CARTRIDGE FAULT                                      |
+| 3Fh  02h  DTLPWRSOMC  CHANGED OPERATING DEFINITION                         |
+| 11h  06h      WR O    CIRC UNRECOVERED ERROR                               |
+| 30h  03h  DT          CLEANING CARTRIDGE INSTALLED                         |
+| 4Ah  00h  DTLPWRSOMC  COMMAND PHASE ERROR                                  |
+| 2Ch  00h  DTLPWRSOMC  COMMAND SEQUENCE ERROR                               |
+| 2Fh  00h  DTLPWRSOMC  COMMANDS CLEARED BY ANOTHER INITIATOR                |
+| 2Bh  00h  DTLPWRSO C  COPY CANNOT EXECUTE SINCE HOST CANNOT DISCONNECT     |
+| 41h  00h  D           DATA PATH FAILURE (SHOULD USE 40 NN)                 |
+| 4Bh  00h  DTLPWRSOMC  DATA PHASE ERROR                                     |
+| 11h  07h      W  O    DATA RESYCHRONIZATION ERROR                          |
+| 16h  00h  D   W  O    DATA SYNCHRONIZATION MARK ERROR                      |
+| 19h  00h  D      O    DEFECT LIST ERROR                                    |
+| 19h  03h  D      O    DEFECT LIST ERROR IN GROWN LIST                      |
+| 19h  02h  D      O    DEFECT LIST ERROR IN PRIMARY LIST                    |
+| 19h  01h  D      O    DEFECT LIST NOT AVAILABLE                            |
+| 1Ch  00h  D      O    DEFECT LIST NOT FOUND                                |
+| 32h  01h  D   W  O    DEFECT LIST UPDATE FAILURE                           |
+| 40h  NNh  DTLPWRSOMC  DIAGNOSTIC FAILURE ON COMPONENT NN (80H-FFH)         |
+| 63h  00h       R      END OF USER AREA ENCOUNTERED ON THIS TRACK           |
+| 00h  05h   T    S     END-OF-DATA DETECTED                                 |
+| 14h  03h   T          END-OF-DATA NOT FOUND                                |
+| 00h  02h   T    S     END-OF-PARTITION/MEDIUM DETECTED                     |
+| 51h  00h   T     O    ERASE FAILURE                                        |
+| 0Ah  00h  DTLPWRSOMC  ERROR LOG OVERFLOW                                   |
+| 11h  02h  DT  W SO    ERROR TOO LONG TO CORRECT                            |
+| 03h  02h   T          EXCESSIVE WRITE ERRORS                               |
+| 3Bh  07h    L         FAILED TO SENSE BOTTOM-OF-FORM                       |
+| 3Bh  06h    L         FAILED TO SENSE TOP-OF-FORM                          |
+| 00h  01h   T          FILEMARK DETECTED                                    |
+| 14h  02h   T          FILEMARK OR SETMARK NOT FOUND                        |
+| 09h  02h      WR O    FOCUS SERVO FAILURE                                  |
+| 31h  01h  D L    O    FORMAT COMMAND FAILED                                |
+| 58h  00h         O    GENERATION DOES NOT EXIST                            |
+| 1Ch  02h  D      O    GROWN DEFECT LIST NOT FOUND                          |
+| 00h  06h  DTLPWRSOMC  I/O PROCESS TERMINATED                               |
+| 10h  00h  D   W  O    ID CRC OR ECC ERROR                                  |
+| 22h  00h  D           ILLEGAL FUNCTION (SHOULD USE 20 00, 24 00, OR 26 00) |
+| 64h  00h       R      ILLEGAL MODE FOR THIS TRACK                          |
+| 28h  01h          M   IMPORT OR EXPORT ELEMENT ACCESSED                    |
+| 30h  00h  DT  WR OM   INCOMPATIBLE MEDIUM INSTALLED                        |
+| 11h  08h   T          INCOMPLETE BLOCK READ                                |
+| 48h  00h  DTLPWRSOMC  INITIATOR DETECTED ERROR MESSAGE RECEIVED            |
+| 3Fh  03h  DTLPWRSOMC  INQUIRY DATA HAS CHANGED                             |
+| 44h  00h  DTLPWRSOMC  INTERNAL TARGET FAILURE                              |
+| 3Dh  00h  DTLPWRSOMC  INVALID BITS IN IDENTIFY MESSAGE                     |
+| 2Ch  02h        S     INVALID COMBINATION OF WINDOWS SPECIFIED             |
+| 20h  00h  DTLPWRSOMC  INVALID COMMAND OPERATION CODE                       |
+| 21h  01h          M   INVALID ELEMENT ADDRESS                              |
+| 24h  00h  DTLPWRSOMC  INVALID FIELD IN CDB                                 |
+| 26h  00h  DTLPWRSOMC  INVALID FIELD IN PARAMETER LIST                      |
+| 49h  00h  DTLPWRSOMC  INVALID MESSAGE ERROR                                |
+| 11h  05h      WR O    L-EC UNCORRECTABLE ERROR                             |
+| 60h  00h        S     LAMP FAILURE                                         |
+| 5Bh  02h  DTLPWRSOM   LOG COUNTER AT MAXIMUM                               |
+| 5Bh  00h  DTLPWRSOM   LOG EXCEPTION                                        |
+| 5Bh  03h  DTLPWRSOM   LOG LIST CODES EXHAUSTED                             |
+| 2Ah  02h  DTL WRSOMC  LOG PARAMETERS CHANGED                               |
+| 21h  00h  DT  WR OM   LOGICAL BLOCK ADDRESS OUT OF RANGE                   |
+| 08h  00h  DTL WRSOMC  LOGICAL UNIT COMMUNICATION FAILURE                   |
+| 08h  02h  DTL WRSOMC  LOGICAL UNIT COMMUNICATION PARITY ERROR              |
+| 08h  01h  DTL WRSOMC  LOGICAL UNIT COMMUNICATION TIME-OUT                  |
+| 4Ch  00h  DTLPWRSOMC  LOGICAL UNIT FAILED SELF-CONFIGURATION               |
+| 3Eh  00h  DTLPWRSOMC  LOGICAL UNIT HAS NOT SELF-CONFIGURED YET             |
+| 04h  01h  DTLPWRSOMC  LOGICAL UNIT IS IN PROCESS OF BECOMING READY         |
+| 04h  00h  DTLPWRSOMC  LOGICAL UNIT NOT READY, CAUSE NOT REPORTABLE         |
+| 04h  04h  DTL    O    LOGICAL UNIT NOT READY, FORMAT IN PROGRESS           |
+| 04h  02h  DTLPWRSOMC  LOGICAL UNIT NOT READY, INITIALIZING COMMAND REQUIRED|
+| 04h  03h  DTLPWRSOMC  LOGICAL UNIT NOT READY, MANUAL INTERVENTION REQUIRED |
+| 25h  00h  DTLPWRSOMC  LOGICAL UNIT NOT SUPPORTED                           |
+| 15h  01h  DTL WRSOM   MECHANICAL POSITIONING ERROR                         |
+| 53h  00h  DTL WRSOM   MEDIA LOAD OR EJECT FAILED                           |
+| 3Bh  0Dh          M   MEDIUM DESTINATION ELEMENT FULL                      |
+| 31h  00h  DT  W  O    MEDIUM FORMAT CORRUPTED                              |
+| 3Ah  00h  DTL WRSOM   MEDIUM NOT PRESENT                                   |
+| 53h  02h  DT  WR OM   MEDIUM REMOVAL PREVENTED                             |
+| 3Bh  0Eh          M   MEDIUM SOURCE ELEMENT EMPTY                          |
+| 43h  00h  DTLPWRSOMC  MESSAGE ERROR                                        |
+| 3Fh  01h  DTLPWRSOMC  MICROCODE HAS BEEN CHANGED                           |
+| 1Dh  00h  D   W  O    MISCOMPARE DURING VERIFY OPERATION                   |
+| 11h  0Ah  DT     O    MISCORRECTED ERROR                                   |
+| 2Ah  01h  DTL WRSOMC  MODE PARAMETERS CHANGED                              |
+| 07h  00h  DTL WRSOM   MULTIPLE PERIPHERAL DEVICES SELECTED                 |
+| 11h  03h  DT  W SO    MULTIPLE READ ERRORS                                 |
+| 00h  00h  DTLPWRSOMC  NO ADDITIONAL SENSE INFORMATION                      |
+| 00h  15h       R      NO CURRENT AUDIO STATUS TO RETURN                    |
+| 32h  00h  D   W  O    NO DEFECT SPARE LOCATION AVAILABLE                   |
+| 11h  09h   T          NO GAP FOUND                                         |
+| 01h  00h  D   W  O    NO INDEX/SECTOR SIGNAL                               |
+| 06h  00h  D   WR OM   NO REFERENCE POSITION FOUND                          |
+| 02h  00h  D   WR OM   NO SEEK COMPLETE                                     |
+| 03h  01h   T          NO WRITE CURRENT                                     |
+| 28h  00h  DTLPWRSOMC  NOT READY TO READY TRANSITION, MEDIUM MAY HAVE CHANGE|
+| 5Ah  01h  DT  WR OM   OPERATOR MEDIUM REMOVAL REQUEST                      |
+| 5Ah  00h  DTLPWRSOM   OPERATOR REQUEST OR STATE CHANGE INPUT (UNSPECIFIED) |
+| 5Ah  03h  DT  W  O    OPERATOR SELECTED WRITE PERMIT                       |
+| 5Ah  02h  DT  W  O    OPERATOR SELECTED WRITE PROTECT                      |
+| 61h  02h        S     OUT OF FOCUS                                         |
+| 4Eh  00h  DTLPWRSOMC  OVERLAPPED COMMANDS ATTEMPTED                        |
+| 2Dh  00h   T          OVERWRITE ERROR ON UPDATE IN PLACE                   |
+| 3Bh  05h    L         PAPER JAM                                            |
+| 1Ah  00h  DTLPWRSOMC  PARAMETER LIST LENGTH ERROR                          |
+| 26h  01h  DTLPWRSOMC  PARAMETER NOT SUPPORTED                              |
+| 26h  02h  DTLPWRSOMC  PARAMETER VALUE INVALID                              |
+| 2Ah  00h  DTL WRSOMC  PARAMETERS CHANGED                                   |
+| 03h  00h  DTL W SO    PERIPHERAL DEVICE WRITE FAULT                        |
+| 50h  02h   T          POSITION ERROR RELATED TO TIMING                     |
+| 3Bh  0Ch        S     POSITION PAST BEGINNING OF MEDIUM                    |
+| 3Bh  0Bh        S     POSITION PAST END OF MEDIUM                          |
+| 15h  02h  DT  WR O    POSITIONING ERROR DETECTED BY READ OF MEDIUM         |
+| 29h  00h  DTLPWRSOMC  POWER ON, RESET, OR BUS DEVICE RESET OCCURRED        |
+| 42h  00h  D           POWER-ON OR SELF-TEST FAILURE (SHOULD USE 40 NN)     |
+| 1Ch  01h  D      O    PRIMARY DEFECT LIST NOT FOUND                        |
+| 40h  00h  D           RAM FAILURE (SHOULD USE 40 NN)                       |
+| 15h  00h  DTL WRSOM   RANDOM POSITIONING ERROR                             |
+| 3Bh  0Ah        S     READ PAST BEGINNING OF MEDIUM                        |
+| 3Bh  09h        S     READ PAST END OF MEDIUM                              |
+| 11h  01h  DT  W SO    READ RETRIES EXHAUSTED                               |
+| 14h  01h  DT  WR O    RECORD NOT FOUND                                     |
+| 14h  00h  DTL WRSO    RECORDED ENTITY NOT FOUND                            |
+| 18h  02h  D   WR O    RECOVERED DATA - DATA AUTO-REALLOCATED               |
+| 18h  05h  D   WR O    RECOVERED DATA - RECOMMEND REASSIGNMENT              |
+| 18h  06h  D   WR O    RECOVERED DATA - RECOMMEND REWRITE                   |
+| 17h  05h  D   WR O    RECOVERED DATA USING PREVIOUS SECTOR ID              |
+| 18h  03h       R      RECOVERED DATA WITH CIRC                             |
+| 18h  01h  D   WR O    RECOVERED DATA WITH ERROR CORRECTION & RETRIES APPLIE|
+| 18h  00h  DT  WR O    RECOVERED DATA WITH ERROR CORRECTION APPLIED         |
+| 18h  04h       R      RECOVERED DATA WITH L-EC                             |
+| 17h  03h  DT  WR O    RECOVERED DATA WITH NEGATIVE HEAD OFFSET             |
+| 17h  00h  DT  WRSO    RECOVERED DATA WITH NO ERROR CORRECTION APPLIED      |
+| 17h  02h  DT  WR O    RECOVERED DATA WITH POSITIVE HEAD OFFSET             |
+| 17h  01h  DT  WRSO    RECOVERED DATA WITH RETRIES                          |
+| 17h  04h      WR O    RECOVERED DATA WITH RETRIES AND/OR CIRC APPLIED      |
+| 17h  06h  D   W  O    RECOVERED DATA WITHOUT ECC - DATA AUTO-REALLOCATED   |
+| 17h  07h  D   W  O    RECOVERED DATA WITHOUT ECC - RECOMMEND REASSIGNMENT  |
+| 17h  08h  D   W  O    RECOVERED DATA WITHOUT ECC - RECOMMEND REWRITE       |
+| 1Eh  00h  D   W  O    RECOVERED ID WITH ECC CORRECTION                     |
+| 3Bh  08h   T          REPOSITION ERROR                                     |
+| 36h  00h    L         RIBBON, INK, OR TONER FAILURE                        |
+| 37h  00h  DTL WRSOMC  ROUNDED PARAMETER                                    |
+| 5Ch  00h  D      O    RPL STATUS CHANGE                                    |
+| 39h  00h  DTL WRSOMC  SAVING PARAMETERS NOT SUPPORTED                      |
+| 62h  00h        S     SCAN HEAD POSITIONING ERROR                          |
+| 47h  00h  DTLPWRSOMC  SCSI PARITY ERROR                                    |
+| 54h  00h     P        SCSI TO HOST SYSTEM INTERFACE FAILURE                |
+| 45h  00h  DTLPWRSOMC  SELECT OR RESELECT FAILURE                           |
+| 3Bh  00h   TL         SEQUENTIAL POSITIONING ERROR                         |
+| 00h  03h   T          SETMARK DETECTED                                     |
+| 3Bh  04h    L         SLEW FAILURE                                         |
+| 09h  03h      WR O    SPINDLE SERVO FAILURE                                |
+| 5Ch  02h  D      O    SPINDLES NOT SYNCHRONIZED                            |
+| 5Ch  01h  D      O    SPINDLES SYNCHRONIZED                                |
+| 1Bh  00h  DTLPWRSOMC  SYNCHRONOUS DATA TRANSFER ERROR                      |
+| 55h  00h     P        SYSTEM RESOURCE FAILURE                              |
+| 33h  00h   T          TAPE LENGTH ERROR                                    |
+| 3Bh  03h    L         TAPE OR ELECTRONIC VERTICAL FORMS UNIT NOT READY     |
+| 3Bh  01h   T          TAPE POSITION ERROR AT BEGINNING-OF-MEDIUM           |
+| 3Bh  02h   T          TAPE POSITION ERROR AT END-OF-MEDIUM                 |
+| 3Fh  00h  DTLPWRSOMC  TARGET OPERATING CONDITIONS HAVE CHANGED             |
+| 5Bh  01h  DTLPWRSOM   THRESHOLD CONDITION MET                              |
+| 26h  03h  DTLPWRSOMC  THRESHOLD PARAMETERS NOT SUPPORTED                   |
+| 2Ch  01h        S     TOO MANY WINDOWS SPECIFIED                           |
+| 09h  00h  DT  WR O    TRACK FOLLOWING ERROR                                |
+| 09h  01h      WR O    TRACKING SERVO FAILURE                               |
+| 61h  01h        S     UNABLE TO ACQUIRE VIDEO                              |
+| 57h  00h       R      UNABLE TO RECOVER TABLE-OF-CONTENTS                  |
+| 53h  01h   T          UNLOAD TAPE FAILURE                                  |
+| 11h  00h  DT  WRSO    UNRECOVERED READ ERROR                               |
+| 11h  04h  D   W  O    UNRECOVERED READ ERROR - AUTO REALLOCATE FAILED      |
+| 11h  0Bh  D   W  O    UNRECOVERED READ ERROR - RECOMMEND REASSIGNMENT      |
+| 11h  0Ch  D   W  O    UNRECOVERED READ ERROR - RECOMMEND REWRITE THE DATA  |
+| 46h  00h  DTLPWRSOMC  UNSUCCESSFUL SOFT RESET                              |
+| 59h  00h         O    UPDATED BLOCK READ                                   |
+| 61h  00h        S     VIDEO ACQUISITION ERROR                              |
+| 50h  00h   T          WRITE APPEND ERROR                                   |
+| 50h  01h   T          WRITE APPEND POSITION ERROR                          |
+| 0Ch  00h   T    S     WRITE ERROR                                          |
+| 0Ch  02h  D   W  O    WRITE ERROR - AUTO REALLOCATION FAILED               |
+| 0Ch  01h  D   W  O    WRITE ERROR RECOVERED WITH AUTO REALLOCATION         |
+| 27h  00h  DT  W  O    WRITE PROTECTED                                      |
+|----------------------------------------------------------------------------|
+
+
+
+
+
+Douglas Gilbert
+dgilbert@interlog.com or dougg@triode.net.au
