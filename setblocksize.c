@@ -83,7 +83,7 @@ To do:          -
 ********************************************************************************
 */
 
-#define TIMEOUT  (7200 * HZ)            /* 2h FORMAT UNIT default timeout */
+#define TIMEOUT  (48000 * HZ)            /* 800 minute FORMAT UNIT default timeout */
 #define BS  512                         /* Default blocksize */
 const char  NAME[] = "setblocksize";
 const char  VER[] = "V0.2";
